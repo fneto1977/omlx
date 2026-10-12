@@ -342,3 +342,24 @@ Todas as medições no mesmo M1 Max 64 GB, com o mesmo harness (`e2e.py` / `lc.p
 | 17k / 34k / 67k / 101k / 128k, greedy | 75,9 / 65,6 / 48,4 / 46,4 / — | 93,2 / 81,3 / 54,7 / 45,7 / 42,1 | +23 / +24 / +13 / −2% / — |
 
 ³ MTP adaptativo (configuração original) medido no overlay.
+
+## Teste do autor e PRs (2026-10-12)
+
+Tarefa: clone simples de Bomberman em HTML/JS com agente de código, iterando até o jogo abrir no
+navegador. Servidor do overlay (`scripts/m1_serve.sh`), números tirados de `~/.omlx/logs/server.log`.
+
+| | Gemma 4 26B | Qwen3.6-35B-A3B | Qwen3.8-27B |
+|---|---|---|---|
+| Tempo total | ~14 min | ~46 min (harness parou em 128k) | ~76 min |
+| Requisições | 32 | 227 | 46 |
+| Maior contexto | 52k | 115k | 117k |
+| Decode médio | 43 tok/s | 44 tok/s | 18,5 tok/s |
+| Prefill de contexto novo | 460–770 tok/s | 560–980 tok/s | 80–184 tok/s |
+
+Os números do Qwen3.8 batem com o comparativo acima (o prefill do 27B denso é o limite no uso
+com agente). Resultado visual melhor no Qwen3.6; qualidade melhor no Qwen3.8, mas lento.
+
+PRs enviados ao `jundot/omlx`:
+- [#4495](https://github.com/jundot/omlx/pull/4495) — DFlash2 sem `num_target_layers`.
+- [#4496](https://github.com/jundot/omlx/pull/4496) — kernels e rotas de atenção M1 (rascunho,
+  acima de 1.000 linhas; escopo declarado: M1 Max 64 GB e os três modelos acima).

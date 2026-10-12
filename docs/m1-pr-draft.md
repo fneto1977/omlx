@@ -1,6 +1,8 @@
 # Rascunho de PR — M1 (applegpu_g13) performance
 
-> Rascunho para abrir no `jundot/omlx` depois dos testes locais do autor. Não enviado.
+> Enviado em 2026-10-12, dividido em dois PRs depois dos testes locais do autor:
+> [jundot/omlx#4495](https://github.com/jundot/omlx/pull/4495) (correção do DFlash2) e
+> [jundot/omlx#4496](https://github.com/jundot/omlx/pull/4496) (kernels M1, rascunho). O texto abaixo é o rascunho original.
 
 ## Summary
 
@@ -33,6 +35,6 @@ Qwen3.6-35B-A3B long-context prefill +11..15%, Gemma 4 long-context prefill +17%
 - [ ] New tests: `tests/test_m1_verify_qmv.py`, `test_m1_verify_mma.py`, `test_fa256_m1_sdpa.py`,
       `test_m1_verify_attn_chunk.py`, `test_dflash2_num_target_layers.py`
 - [ ] Existing suites unchanged versus `bafc6837` on the same runtime
-- [ ] Author's local end-to-end runs on M1 Max (pending)
+- [x] Author's local end-to-end runs on M1 Max (agentic coding session with the three models, 2026-10-12)
 
 🤖 Generated with [Claude Code](https://claude.com/claude-code)
