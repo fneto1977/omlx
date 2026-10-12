@@ -126,6 +126,21 @@ Critério de go: projeção de ≥ +15% de decode a 128k.
 
 ---
 
+## Status das fases
+
+| Fase | Status | Resultado |
+|---|---|---|
+| 1 — DFlash2 no Qwen3.8 | Concluída — aprovada | Decode +18–63% em contexto longo (greedy e amostrado), +34% editando; −27% escrevendo código novo em contexto curto com amostragem. Aplicada. |
+| 2 — Kernel de verificação 5–16 linhas | Concluída — aprovada | −8 a −26% por projeção; integrada (`m1_verify_mma.py`). |
+| 3 — Robustez do DFlash | Concluída | Fallback de `num_target_layers`, erro explícito; DFlash2 no 35B medido e rejeitado. |
+| 4 — Profundidade do MTP | Concluída — aprovada (35B) | Fixa 3 no 35B-A3B (+4–25%); no Gemma o adaptativo venceu. |
+| 5 — Atenção / KV em contexto longo | Concluída — passos 1–3 do plano | (1) medido: kernel MPP ~95 GB/s; (2) protótipos: kernel GQA próprio (mais lento) e KV INT8 (26–71% mais lento) — no-go por critério; ajuste das fatias (−7 a −21%) e rota head_dim 512 (−34 a −37%) aprovados. |
+| 6 — Consolidação | Concluída | Branch `m1-performance`, overlay, testes, configurações aplicadas com backup. |
+| Extra — repositórios | Concluída | Splash-M1, mlx-dspark, MTPLX, mlxcel, zenlm/engine (seção abaixo). |
+| Extra — modelos | Concluída | Gemma 4 26B-A4B (seção abaixo). |
+
+---
+
 ## Resultados da execução (2026-10-12)
 
 ### Fase 1 — DFlash2 no Qwen3.8: **aprovada**
@@ -268,3 +283,62 @@ head_dim 512 e K=V), MoE 128 experts / 8 ativos, vocabulário de 262k.
   dentro do ruído.
 - Ajuste junto: a rota M1 de head_dim 256 só a partir de 3072 chaves (o primeiro bloco de
   2048 é 10–19% mais rápido no kernel steel).
+
+## Comparativo antes × depois (Qwen3.8-27B e Qwen3.6-35B-A3B)
+
+Todas as medições no mesmo M1 Max 64 GB, com o mesmo harness (`e2e.py` / `lc.py`), tok/s.
+
+- **Antes** = oMLX.app 0.7.0 com a configuração original (tier de memória `balanced`; Qwen3.8 com
+  MTP e ANE com a CPU ligada; 35B-A3B com MTP adaptativo).
+- **Só config** = oMLX.app 0.7.0 com a configuração nova (teto de 52 GB, ANE sem CPU e com GDN),
+  sem o patch M1. Usado como referência em contexto longo, onde a configuração original não
+  chegou a ser medida até o fim (o tier `balanced` descartava o ANE no primeiro prompt longo).
+- **Depois** = servidor do overlay M1 (`scripts/m1_serve.sh`) com a configuração aplicada
+  (Qwen3.8: DFlash2 bloco 8; 35B-A3B: MTP profundidade 3).
+- Ruído entre rodadas: ±5% (mais à tarde: até −15–30% por efeito térmico/tela, ver Fase 6).
+
+### Qwen3.8-27B — prefill (tok/s)
+
+| Contexto | Antes | Só config | Depois | Antes → Depois |
+|---|---|---|---|---|
+| ~6k (prompt único) | 139,5 | 197,0 | — | +41% (config) |
+| 0–17k | — | 175,1 | 187,5 | +7% vs só config |
+| 17–34k | — | 145,8 | 142,5 | ruído |
+| 34–67k | — | 110,6 | 108,9 | ruído |
+| 67–101k | — | 84,7 | 89,2 | +5% |
+| 101–133k | — | 69,5 | 71,1 | +2% |
+
+### Qwen3.8-27B — decode (tok/s)
+
+| Carga | Antes | Depois | Variação |
+|---|---|---|---|
+| Escrever código, curto, greedy | 25,3 | 27,0 | +7% |
+| Escrever código, curto, amostrado (temp. 1,0) | 25,8 | 16,4 | **−36%** |
+| Editar arquivo, curto, amostrado | 41,7 | 44,6 | +7% |
+| Editar arquivo, curto, greedy | 44,6¹ | 53–58 | +20–31% |
+| 17k / 34k / 67k / 101k / 133k, greedy | 31,3 / 28,1 / 23,8 / 19,2 / 17,6² | 40,4 / 32,8 / 33,7 / 27,5 / 24,2 | +29 / +17 / +42 / +43 / +38% |
+| ~35k / ~103k, amostrado | 25,9 / 18,0¹ | 34,2 / 29,3 | +32 / +63% |
+
+¹ MTP medido no overlay (no app o MTP rende igual ou menos).  ² Só config (MTP, app).
+
+### Qwen3.6-35B-A3B — prefill (tok/s)
+
+| Contexto | Antes | Depois | Variação |
+|---|---|---|---|
+| ~6k (prompt único) | 1052 | — | — |
+| 0–17k | 886 | 902 | +2% |
+| 17–34k | 594 | 658 | +11% |
+| 34–67k | 407 | 466 | +15% |
+| 67–101k | 286 | 327 | +14% |
+| 101–128k | — (passou do limite de 131072 do teste) | 258 | — |
+
+### Qwen3.6-35B-A3B — decode (tok/s)
+
+| Carga | Antes | Depois | Variação |
+|---|---|---|---|
+| Escrever código, curto, amostrado (0,7/0,8/40) | 72,1³ | 75,0 | +4% |
+| Editar arquivo, curto, amostrado | 92,6³ | 100,2 | +8% |
+| Editar arquivo, curto, greedy | 77,7³ | 93,0 | +20% |
+| 17k / 34k / 67k / 101k / 128k, greedy | 75,9 / 65,6 / 48,4 / 46,4 / — | 93,2 / 81,3 / 54,7 / 45,7 / 42,1 | +23 / +24 / +13 / −2% / — |
+
+³ MTP adaptativo (configuração original) medido no overlay.
