@@ -129,7 +129,7 @@ _KERNEL_CALL = """kernel(
 _ATTEND = """    m1_sdpa = _m1_sdpa_enabled()
 
     def attend(queries, keys, values, scale):
-        if m1_sdpa:
+        if m1_sdpa and keys.shape[2] >= _M1_SDPA_MIN_KV:
             rows = _m1_query_rows(queries.shape[1], queries.shape[2], keys.shape[2])
             if rows:
                 return _m1_chunked_sdpa(queries, keys, values, scale, rows)
@@ -152,13 +152,30 @@ def _fa256_m1_edits() -> list:
     """Copy the M1 SDPA constants/helpers from this repo's fa256 patch."""
     source = (REPO / "omlx" / "patches" / "qwen35_fa256_attention.py").read_text()
     consts = source[source.index("# M1-class GPUs (applegpu_g13)") : source.index("_M1_SDPA_MIN_ROWS = 64")]
-    consts += "_M1_SDPA_MIN_ROWS = 64\n_M1_SDPA_CACHE_TRIM = 2 * 1024**3\n"
+    consts += "_M1_SDPA_MIN_ROWS = 64\n_M1_SDPA_MIN_KV = 3072\n_M1_SDPA_CACHE_TRIM = 2 * 1024**3\n"
     helpers = source[source.index("def _m1_sdpa_enabled()") : source.index("def _should_route(")]
+    consts += source[source.index("# Head_dim 512 (Gemma 4 global layers)") : source.index("_M1_D512_MIN_KV = 32768")]
+    consts += "_M1_D512_MIN_KV = 32768\n"
     lm_call = _KERNEL_CALL.format(i=" " * 20)
     vlm_call = _KERNEL_CALL.format(i=" " * 24)
     return [
         ("_PATCHED = False\n", "_PATCHED = False\n\n" + consts),
         ("def _should_route(", helpers + "def _should_route("),
+        ("import logging\nimport os\n", "import functools\nimport logging\nimport os\n"),
+        (
+            "\n            routed = _should_route(queries, keys, cache, mask, sinks, min_kv_len)\n",
+            "\n            m1_out = _m1_d512_attention(queries, keys, values, cache, scale, mask, sinks)\n"
+            "            if m1_out is not None:\n"
+            "                return m1_out\n"
+            "            routed = _should_route(queries, keys, cache, mask, sinks, min_kv_len)\n",
+        ),
+        (
+            "\n                routed = _should_route(queries, keys, cache, mask, sinks, min_kv_len)\n",
+            "\n                m1_out = _m1_d512_attention(queries, keys, values, cache, scale, mask, sinks)\n"
+            "                if m1_out is not None:\n"
+            "                    return m1_out\n"
+            "                routed = _should_route(queries, keys, cache, mask, sinks, min_kv_len)\n",
+        ),
         ("    patched_any = False\n", _ATTEND),
         ("return " + lm_call, "return attend(queries, keys, values, scale)"),
         ("return " + vlm_call, "return attend(queries, keys, values, scale)"),

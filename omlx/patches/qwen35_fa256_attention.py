@@ -16,6 +16,7 @@ SDPA implementation is called unchanged.
 
 from __future__ import annotations
 
+import functools
 import logging
 import os
 import sys
@@ -82,8 +83,18 @@ _K_BLOCK = 8
 _M1_SDPA_WORK = 120_000_000
 _M1_SDPA_MAX_WORK = 160_000_000
 _M1_SDPA_MIN_ROWS = 64
+# The first prefill chunk (keys == queries == 2048) is 10-19% faster on the
+# steel kernel; from 3072 keys the chunked route wins by 6-32% (M1 Max,
+# 16/8, 24/4 and 16/2 layouts).
+_M1_SDPA_MIN_KV = 3072
 # Trim MLX's buffer cache above this many bytes after a chunked call.
 _M1_SDPA_CACHE_TRIM = 2 * 1024**3
+# Head_dim 512 (Gemma 4 global layers) has no fused MLX route at all, so the
+# stock path materializes every score: one 2048-row chunk over 128k keys
+# peaked at +8.9 GB and ran at 4.4 TFLOP/s on M1 Max; the chunked route ran
+# it at 7.0 TFLOP/s (-37%) within +0.6 GB. Routed from this many keys on
+# (below it the two tie on time; the chunking still bounds memory).
+_M1_D512_MIN_KV = 32768
 _M1_K_BLOCK = 16
 
 
@@ -230,6 +241,38 @@ def _m1_chunked_sdpa(queries, keys, values, scale: float, rows: int) -> mx.array
     return outs[0] if len(outs) == 1 else mx.concatenate(outs, axis=2)
 
 
+def _m1_d512_attention(queries, keys, values, cache, scale, mask, sinks):
+    """Causal head_dim-512 prefill attention through the M1 chunked route, or
+    None when the call is not that shape (or not on an M1-class GPU)."""
+    if (
+        queries.ndim != 4
+        or queries.shape[-1] != 512
+        or queries.shape[-2] < _MIN_ROUTE_Q_LEN
+        or sinks is not None
+        or not (isinstance(mask, str) and mask == "causal")
+        or _has_quantized_cache(cache)
+        or getattr(keys, "ndim", 0) != 4
+        or getattr(values, "ndim", 0) != 4
+        or keys.shape[-1] != 512
+        or values.shape[-1] != 512
+        or queries.dtype not in (mx.float16, mx.bfloat16)
+        or keys.dtype != queries.dtype
+        or values.dtype != queries.dtype
+        or keys.shape[-3] == 0
+        or queries.shape[-3] % keys.shape[-3]
+        or keys.shape[-2] < max(_M1_D512_MIN_KV, queries.shape[-2])
+        or not _m1_sdpa_enabled_cached()
+    ):
+        return None
+    rows = _m1_query_rows(queries.shape[1], queries.shape[2], keys.shape[2])
+    return _m1_chunked_sdpa(queries, keys, values, scale, rows or _M1_SDPA_MIN_ROWS)
+
+
+@functools.cache
+def _m1_sdpa_enabled_cached() -> bool:
+    return _m1_sdpa_enabled()
+
+
 def _should_route(queries, keys, cache, mask, sinks, min_kv_len: int) -> bool:
     # Query-shape gates first: this runs on every SDPA call of every decode
     # step, so the common (decode / MTP verify) case must exit on the q_len
@@ -321,7 +364,7 @@ def apply_qwen35_fa256_attention_patch(min_kv_len: int | None = None) -> bool:
         dispatch_budget = _auto_dispatch_budget(kernel, q_block, k_block)
 
     def attend(queries, keys, values, scale):
-        if m1_sdpa:
+        if m1_sdpa and keys.shape[2] >= _M1_SDPA_MIN_KV:
             rows = _m1_query_rows(queries.shape[1], queries.shape[2], keys.shape[2])
             if rows:
                 return _m1_chunked_sdpa(queries, keys, values, scale, rows)
@@ -352,6 +395,9 @@ def apply_qwen35_fa256_attention_patch(min_kv_len: int | None = None) -> bool:
             mask: mx.array | None,
             sinks: mx.array | None = None,
         ) -> mx.array:
+            m1_out = _m1_d512_attention(queries, keys, values, cache, scale, mask, sinks)
+            if m1_out is not None:
+                return m1_out
             if _should_route(queries, keys, cache, mask, sinks, min_kv_len):
                 try:
                     return attend(queries, keys, values, scale)
@@ -390,6 +436,11 @@ def apply_qwen35_fa256_attention_patch(min_kv_len: int | None = None) -> bool:
                 mask=None,
                 sinks=None,
             ):
+                m1_out = _m1_d512_attention(
+                    queries, keys, values, cache, scale, mask, sinks
+                )
+                if m1_out is not None:
+                    return m1_out
                 if _should_route(queries, keys, cache, mask, sinks, min_kv_len):
                     try:
                         return attend(queries, keys, values, scale)

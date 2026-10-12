@@ -164,8 +164,11 @@ Ciclo do DFlash2 bloco 8: 144 → 131 ms.
   (overhead de redução entre simdgroups e softmax por linha) — **descartado**.
 - Ajuste do tamanho das fatias de chaves no M1 (≈1 threadgroup por núcleo, 1024–4096 chaves):
   −7% a −21% no tempo da atenção de verificação — **aplicado**.
-- KV INT8: **no-go** por ora (exigiria reescrever esse kernel; TurboQuant 8-bit dobrou o custo do
-  decode no M1).
+- KV INT8 — protótipo medido (`quantized_matmul` agrupando as G×L linhas de cada cabeça de KV,
+  KV 8-bit lido uma vez, máscara causal por linha): a 128k ficou 43–71% mais lento que o kernel
+  fp16 atual no Qwen3.8 (8,0–9,3 × 5,4–5,8 ms por camada) e 26–52% no 35B; erro 1e-4–4e-4.
+  Critério de go (≥ +15% de decode a 128k) não atingido — **no-go**. Um kernel INT8 fundido
+  exigiria a mesma reescrita que já perdeu para o kernel MPP.
 
 ### Fase 3 (cont.) — DFlash2 no 35B-A3B
 
@@ -221,3 +224,47 @@ Para desligar uma otimização: `OMLX_M1_VERIFY_QMV=0`, `OMLX_M1_VERIFY_MMA=0`,
 Configurações recomendadas por modelo: ver "Fase 6" acima. Ao atualizar o oMLX.app, rode
 `scripts/m1_overlay.py` de novo; se a versão nova mudar os trechos esperados, ele aborta em vez
 de aplicar o patch errado.
+
+## Validação com amostragem real (temperatura > 0)
+
+As decisões acima foram medidas em greedy; repetidas com a amostragem de cada modelo
+(Qwen3.8: temperatura 1,0 do `generation_config`; 35B-A3B: 0,7/top_p 0,8/top_k 40):
+
+| Carga | Qwen3.8 MTP | Qwen3.8 DFlash2 | 35B adaptativo | 35B fixo 3 |
+|---|---|---|---|---|
+| Escrever código, contexto curto | 22,5 | 16,4 | 72,1 | 75,0 |
+| Editar arquivo, contexto curto | 33,3 | 44,6 | 92,6 | 100,2 |
+| ~35k de contexto | 25,9 | 34,2 | | |
+| ~103k de contexto | 18,0 | 29,3 | | |
+
+DFlash2 mantido no Qwen3.8 (agentes / contexto longo); só perde escrevendo código novo em
+contexto curto. Profundidade 3 mantida no 35B-A3B.
+
+## Repositórios analisados (ideias para o M1)
+
+| Projeto | O que foi aproveitado / medido |
+|---|---|
+| Splash-M1 (paperniuk) | Drafter DFlash2 + verificação de 8 linhas → Fase 1/2; prefill em comandos curtos (já coberto). |
+| mlx-dspark | `skinny_qmm` → `m1_verify_mma.py` (Fase 2); lição de microbenchmark em cadeia dependente. |
+| MTPLX | Kernel "packed-row GQA" de verificação: no M1 vence só com 2–3 linhas no layout 16/2 (−11 a −66%); com 4 linhas (profundidade 3 do 35B) −3 a −9%, com 5–8 linhas perde muito — ganho de decode estimado em 1–2%, não integrado. Confirma o uso de checkpoints fp16 no M1/M2. |
+| mlxcel | Confirma de forma independente que na geração 13 (M1) a verificação de várias linhas em projeções quantizadas é o gargalo (sem `qmv_wide`) — exatamente o que os kernels M1 resolvem. Regras de aceitação com temperatura > 0 → validação acima. |
+| zenlm/engine | Fork do mistral.rs com kernels Metal genéricos (paged attention, HQQ/BnB/FP8); nada específico para Qwen3.5/GDN ou M1. |
+
+## Gemma 4 26B-A4B (`Jundot/gemma-4-26B-A4B-it-oQ4e-mtp`)
+
+Arquitetura: 30 camadas (25 com janela deslizante de 1024, head_dim 256; 5 globais com
+head_dim 512 e K=V), MoE 128 experts / 8 ativos, vocabulário de 262k.
+
+- **fp16 em vez de bf16** (cópia com `scripts/clone_mlx_model_fp16.py`, pesos validados
+  dentro do limite do fp16; resposta de referência correta): prefill +30% (661 → 871 tok/s),
+  decode +9–12%.
+- **MTP** (cabeça própria do pacote oQ): escrever ±0 (greedy) / −5% (amostrado); editar
+  +47% / +44%. Controle adaptativo melhor que profundidade fixa (fixa 2: +5% escrevendo,
+  −18% editando). Configuração: MTP ligado, adaptativo.
+- **Atenção global head_dim 512 no prefill**: o MLX não tem rota fundida; nova rota M1
+  fatiada (`_m1_d512_attention`, a partir de 32k chaves): −34 a −37% de tempo de atenção a
+  65–128k e pico de memória de +8,9 GB para +0,6 GB. Curva longa (fp16 + MTP), rota ligada ×
+  desligada: 71–103k 305 × 281 tok/s, 103–136k 252 × 216 tok/s (+17%); abaixo de 70k
+  dentro do ruído.
+- Ajuste junto: a rota M1 de head_dim 256 só a partir de 3072 chaves (o primeiro bloco de
+  2048 é 10–19% mais rápido no kernel steel).
