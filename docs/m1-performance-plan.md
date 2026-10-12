@@ -1,0 +1,168 @@
+# Plano de performance M1 — Qwen3.8-27B e Qwen3.6-35B-A3B
+
+Máquina: MacBook M1 Max, 64 GB, GPU `applegpu_g13s` (~400 GB/s), oMLX.app 0.7.0
+(runtime MLX 0.32.2). Código: `~/Desenvolvimento/omlx-m1/omlx`, testado via
+overlay (`scripts/m1_overlay.py` + `scripts/m1_serve.sh`).
+
+Modelos-alvo:
+
+| Modelo | Objetivo |
+|---|---|
+| `Qwen3.8-27B-oQ4e-fp16-mtp` (denso, GDN + atenção) | prefill **e** decode |
+| `Qwen3.6-35B-A3B-oQ4-fp16-mtp` (MoE) | prefill (decode já está bom) |
+
+Fora do escopo por enquanto: Qwen3.8 Flash Next. Próxima rodada: Gemma 4 26B MoE e mais um modelo.
+
+## Linha de base atual (com o patch M1 e a configuração aplicada)
+
+| Medida | Qwen3.8 | 35B-A3B |
+|---|---|---|
+| Decode, contexto curto | ~27,5 tok/s (MTP) | ~98 tok/s (MTP) |
+| Prefill 17k / 34k / 67k / 101k / 133k | 182 / 155 / 117 / 96 / 73 tok/s | 939 / 673 / 469 / 322 / 258 tok/s |
+| Decode a 101k / 133k | 21,2 / 18,2 tok/s | 44 / 38 tok/s |
+
+Referência externa (Splash-M1, mesmo M1 Max 64 GB): Qwen3.8 decode 38 tok/s, 35B-A3B 145 tok/s,
+prefill do 27B de 133 tok/s a 8k e 110 tok/s a 32k.
+
+## Protocolo de medição (vale para todas as fases)
+
+1. Servidor isolado: `OMLX_BASE_PATH` no scratchpad, porta 18123, nunca o servidor do app.
+2. **Nunca** rodar dois benchmarks de GPU ao mesmo tempo (pytest incluso); checar com
+   `pgrep -fl "omlx.cli serve"` antes de cada medição.
+3. Decode: prompt de código fixo (`e2e.py`), 400 tokens, 3 repetições, mediana; contexto
+   longo: `lc.py` (prefixo crescente 16k→128k, cache de prefixo ligado).
+4. Antes de comparar, anotar swap (`sysctl vm.swapusage`); acima de ~8 GB de swap, reiniciar
+   a medição depois de liberar memória.
+5. A/B sempre na mesma sessão térmica: alternar configurações em vez de rodar todas as
+   de uma e depois todas da outra.
+6. Ruído esperado: ±5%. Só aceitar mudanças que ganhem mais que isso em duas rodadas.
+7. Qualidade: `quality.py` (pergunta factual sobre documento de 5,6k tokens, greedy) e a
+   resposta precisa continuar correta; para drafters, conferir que a taxa de aceitação faz
+   sentido (aceitação não muda o texto, só a velocidade).
+
+## Fase 1 — DFlash2 no Qwen3.8 (decode) — prioridade máxima
+
+Hipótese: o drafter `incoai/Qwen3.8-27B-DFlash2` aceita ~4–5 tokens por ciclo; com a
+verificação de 8 linhas custando ~2× um decode no M1, o decode sobe de ~27,5 para 35–40 tok/s
+(é o que o Splash-M1 mostra).
+
+Testes:
+1. Carregar o drafter com quantização do oMLX (`dflash_draft_quant_enabled`, 4 bits, grupo 64)
+   e conferir no log `DFlash drafter attached ... kind=dflash2` (sem "load raised").
+2. A/B MTP × DFlash2: contexto curto (3 repetições), 32k e 128k.
+3. Variar `dflash_block_size` / `runtime_block_size` (3–8) e `dflash_verify_mode`
+   (`dflash` / `adaptive`) — no M1 o custo da verificação cresce por linha.
+4. Conferir uso de memória (drafter ~0,9 GB em 4 bits) com o ANE ligado e teto de 52 GB.
+
+Critério de aceite: ≥ +15% de decode sobre o MTP em contexto curto, sem perder no longo.
+Se aprovado, aplicar `dflash_enabled` no `model_settings.json` do Qwen3.8.
+
+## Fase 2 — Kernel de verificação para 8–16 linhas (ideia do `skinny_qmm`)
+
+Hipótese: a verificação do DFlash2 usa 8–9 linhas; o `skinny_qmm` do mlx-dspark (pesos como
+operando A do `simdgroup_matrix`, sem staging) mediu 10–21% melhor que o `sg8`/`mma` no M1.
+
+Implementação:
+1. Kernel próprio (implementação independente da ideia, crédito no docstring) em
+   `omlx/patches/m1_verify_qmv.py` ou módulo irmão: entrada fp16 (o original lê bf16),
+   4-bit e 5-bit (o Qwen3.8 tem 27 `down_proj` e 48 `out_proj` em 5 bits).
+2. Roteamento em `qwen35_verify_qmm._verify_route` só para `applegpu_g13`, janela de linhas
+   definida pela medição.
+3. Testes de numerics como `tests/test_m1_verify_qmv.py`.
+
+Critério de aceite: microbenchmark ≥ 10% melhor nas formas reais e ganho no tempo por ciclo
+do DFlash2 (log `backbone=...ms`).
+
+## Fase 3 — Correções de robustez do DFlash
+
+1. Drafter sem `num_target_layers` (caso do `mlx-community/Qwen3.6-35B-A3B-DFlash2-4bit`):
+   inferir do número de camadas do alvo antes da validação.
+2. Falha ao carregar drafter hoje cai em decode sem especulação **silenciosamente**: elevar
+   para aviso claro no log e na UI/admin.
+3. Reavaliar DFlash2 no 35B-A3B com bloco menor (3–4): no MoE cada linha extra ativa experts
+   novos, por isso o bloco 8 perdeu para o MTP (67 × 98 tok/s).
+
+Critério de aceite: testes unitários das correções; 35B-A3B só muda de MTP para DFlash2 se
+ganhar > 5% nas duas rodadas.
+
+## Fase 4 — Profundidade de rascunho calibrada pela máquina (ideia do mlx-dspark)
+
+Hipótese: o controle adaptativo do MTP escolheu rascunhos curtos demais com o kernel M1
+(tokens/ciclo caiu de 2,6 para 2,0). Medir uma vez a curva de custo da verificação por número
+de linhas neste GPU (cache por modelo/quantização/versão do MLX) e usá-la no controle.
+
+Testes: A/B adaptativo atual × calibrado, nos dois modelos, decode curto e 64k.
+Critério de aceite: ≥ +5% de decode sem perda em nenhum ponto.
+
+## Fase 5 — Decode em contexto longo: KV INT8 (ideia do Splash-M1) — investigação
+
+Hipótese: a 100k+ a leitura do KV domina a verificação (decode do Qwen3.8 cai de 31 para
+18 tok/s). O Splash-M1 usa cache INT8 com kernels de atenção próprios (1,7–1,9× mais rápido
+que bf16 no M1). O TurboQuant 8-bit do oMLX **piorou** o decode no M1 (32 → 16 tok/s), então
+seria um caminho novo.
+
+Passos: (1) medir quanto do ciclo a 64k/128k é atenção (instrumentação por camada);
+(2) protótipo de atenção de decode/verify sobre KV INT8 simétrico por grupo; (3) go/no-go.
+Critério de go: projeção de ≥ +15% de decode a 128k.
+
+## Fase 6 — Consolidação
+
+1. Atualizar `scripts/m1_overlay.py` com o que for aprovado; regenerar `~/.omlx/m1-overlay`.
+2. Rodar a suíte de testes relevante (o conjunto de 45 falhas pré-existentes deve continuar
+   idêntico).
+3. Benchmark final completo (protocolo acima) e tabela comparativa antes/depois.
+4. Aplicar as configurações aprovadas em `~/.omlx/model_settings.json` (com backup).
+
+## Ordem e estimativa
+
+| Fase | Depende de | Esforço | Ganho esperado |
+|---|---|---|---|
+| 1 DFlash2 Qwen3.8 | download (feito) | baixo | alto (decode +25–40%) |
+| 3 Correções DFlash | — | baixo | robustez; talvez 35B |
+| 2 Kernel 8–16 linhas | 1 aprovado | médio | +10% no decode com DFlash2 |
+| 4 Profundidade calibrada | — | médio | +5–10% decode MTP |
+| 5 KV INT8 | 1–4 | alto | decode a 100k+ (incerto) |
+| 6 Consolidação | todas | baixo | — |
+
+---
+
+## Resultados da execução (2026-10-12)
+
+### Fase 1 — DFlash2 no Qwen3.8: **aprovada**
+
+Drafter `incoai/Qwen3.8-27B-DFlash2` (BF16 3,85 GB, quantizado pelo oMLX para 4 bits, grupo 64),
+bloco 8. Decode (tok/s, mediana de 3):
+
+| Carga | MTP | DFlash2 bloco 8 |
+|---|---|---|
+| Escrever código do zero, contexto curto | 28,1 | 27,0 |
+| Editar arquivo (agente), contexto curto | 44,6 | 53–58 |
+| Contexto 17k / 34k / 67k / 101k / 133k | 30,6 / 27,8 / 24,1 / 21,2 / 18,2 | 40,4 / 32,8 / 33,7 / 27,5 / 24,2 |
+
+Prefill com DFlash2: 3–8% mais lento (captura de estados ocultos para o drafter).
+Blocos 3–6 e `dflash_verify_mode` não ajudam (o modo de verificação é ignorado pelo DFlash em
+lote do oMLX).
+
+### Fase 2 — kernel de verificação 5–16 linhas: **aprovado**
+
+`omlx/patches/m1_verify_mma.py` (adaptado do `skinny_qmm` do mlx-dspark, MIT): pesos como
+operando A de `simdgroup_matrix`, entrada fp16. Cadeia dependente up/down do Qwen3.8 (ms por
+projeção; decode de 1 linha = 0,169): 5–8 linhas 0,315–0,356 → 0,287; 9–16 linhas 0,660 → 0,471.
+Ciclo do DFlash2 bloco 8: 144 → 131 ms.
+
+### Fase 3 — robustez DFlash: **feito**
+
+- `num_target_layers` ausente no config do drafter: preenchido com o número de camadas do alvo
+  (`speculative/dflash_drafter.py`).
+- Falha ao carregar o drafter agora é ERROR explicando que a especulação ficou desligada.
+
+### Fase 5 — atenção de verificação em contexto longo
+
+- O caminho real no M1 (macOS 26) é o kernel de *tensor ops* MPP (`_gqa_causal_sdpa`): ~5,6–5,9 ms
+  por camada a 128k (~95 GB/s), praticamente igual de 2 a 8 linhas.
+- Kernel próprio com `simdgroup_matrix` agrupado por cabeça de KV: correto, porém 1,2–6× mais lento
+  (overhead de redução entre simdgroups e softmax por linha) — **descartado**.
+- Ajuste do tamanho das fatias de chaves no M1 (≈1 threadgroup por núcleo, 1024–4096 chaves):
+  −7% a −21% no tempo da atenção de verificação — **aplicado**.
+- KV INT8: **no-go** por ora (exigiria reescrever esse kernel; TurboQuant 8-bit dobrou o custo do
+  decode no M1).

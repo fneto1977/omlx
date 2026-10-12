@@ -549,6 +549,21 @@ _GQA_MAX_GROUP = 8
 _GQA_MIN_KEYS = 64
 
 
+@functools.cache
+def _m1_gpu() -> bool:
+    from omlx.utils.hardware import get_apple_gpu_generation
+
+    return get_apple_gpu_generation() == 13
+
+
+def _m1_gqa_chunk(kv_len: int, kv_heads: int) -> int:
+    """Keys per split on M1: about one threadgroup per GPU core (32 on an M1
+    Max), 1024..4096 keys. The 512-key splits tuned on M3 Ultra leave M1 7-21%
+    slower from 32k to 128k keys (measured on the 24/4 and 16/2 layouts)."""
+    chunk = -(-kv_len * kv_heads // 32)
+    return min(4096, max(1024, (chunk + 63) // 64 * 64))
+
+
 def _gqa_causal_sdpa(queries, keys, values, scale):
     """Causal verify attention for up to eight rows, one pass per KV head."""
     _, heads, q_len, dim = queries.shape
@@ -564,7 +579,9 @@ def _gqa_causal_sdpa(queries, keys, values, scale):
     )
     # Short splits beyond 16k keys keep a KV head's blocks in cache between
     # splits; measured best on M3 Ultra from 2k to 64k keys.
-    if kv_len > 16384:
+    if kv_len > 16384 and _m1_gpu():
+        chunk = _m1_gqa_chunk(kv_len, kv_heads)
+    elif kv_len > 16384:
         chunk = 512
     else:
         chunk = max(256, (-(-kv_len // 16) + 63) // 64 * 64)
