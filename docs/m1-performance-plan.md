@@ -166,3 +166,58 @@ Ciclo do DFlash2 bloco 8: 144 → 131 ms.
   −7% a −21% no tempo da atenção de verificação — **aplicado**.
 - KV INT8: **no-go** por ora (exigiria reescrever esse kernel; TurboQuant 8-bit dobrou o custo do
   decode no M1).
+
+### Fase 3 (cont.) — DFlash2 no 35B-A3B
+
+Com a correção, `mlx-community/Qwen3.6-35B-A3B-DFlash2-4bit` carrega sem ajuste manual, mas no MoE
+cada linha a mais de verificação ativa experts novos: blocos 3/4/8 deram 84/75/53 tok/s
+(escrita) contra 101 do MTP — **mantido o MTP**.
+
+### Fase 4 — profundidade do MTP: **aprovada (35B-A3B)**
+
+O controle adaptativo do oMLX já mede custos por máquina, mas no M1 escolheu profundidades
+piores que as fixas no 35B-A3B. Decode (tok/s):
+
+| Carga | Adaptativo | Fixa 2 | Fixa 3 |
+|---|---|---|---|
+| Escrever, contexto curto | 93,9 | 101,5 | 95,6 |
+| Editar, contexto curto | 77,7 | 92,2 | 93,0 |
+| 17k / 34k / 67k / 101k / 128k | 85 / 65 / 55 / 42 / 43 | 83 / 70 / 49 / 38 / 37 | 93 / 81 / 55 / 46 / 42 |
+
+Escolha: `mtp_fixed_depth = 3` (melhor ou igual em quase todos os pontos).
+
+### Fase 6 — consolidação
+
+- Branch `m1-performance` em `github.com/fneto1977/omlx`, sobre o upstream `bafc6837`.
+- Testes: mesma lista de falhas pré-existentes do upstream nesta combinação de runtime
+  (421 × 420, a diferença é um teste instável); todos os testes novos passam.
+- Configuração aplicada em `~/.omlx/model_settings.json` (backup `*.bak-20261012-114526`):
+  - Qwen3.8: `mtp_enabled=false`, `dflash_enabled=true`,
+    `dflash_draft_model=/Volumes/DADOS/omlx/models/incoai/Qwen3.8-27B-DFlash2`, quantização do
+    drafter 4 bits / grupo 64 / ativações 16, `dflash_block_size=8`; ANE com GDN, sem CPU.
+  - Qwen3.6-35B-A3B: `mtp_fixed_depth=3`.
+  - Global: `memory_guard_tier=custom`, teto 52 GB.
+- **Importante**: o DFlash2 do Qwen3.8 só compensa com os kernels M1 (overlay). No oMLX.app sem
+  patch ele ficou −16% ao escrever código novo (+8% editando).
+- Observação de medição: no fim do dia a GPU passou a entregar ~14% menos banda sob carga
+  sustentada (e −15 a −30% no decode ponta a ponta) com código e configuração idênticos —
+  efeito ambiental (atividade de tela/térmica). Todas as decisões acima vêm de A/B na mesma
+  sessão.
+
+## Como usar (para compartilhar)
+
+Requisitos: Mac M1/M1 Pro/Max/Ultra, oMLX.app 0.7.0 instalado.
+
+```bash
+git clone -b m1-performance https://github.com/fneto1977/omlx
+cd omlx
+python3 scripts/m1_overlay.py      # cria ~/.omlx/m1-overlay a partir do oMLX.app instalado
+# pare o servidor do app (menu do oMLX) e então:
+scripts/m1_serve.sh                # mesmo ~/.omlx, mesma porta; argumentos extras vão para `omlx serve`
+```
+
+Para desligar uma otimização: `OMLX_M1_VERIFY_QMV=0`, `OMLX_M1_VERIFY_MMA=0`,
+`OMLX_FA256_M1_SDPA=0` (variáveis de ambiente antes de `m1_serve.sh`).
+Configurações recomendadas por modelo: ver "Fase 6" acima. Ao atualizar o oMLX.app, rode
+`scripts/m1_overlay.py` de novo; se a versão nova mudar os trechos esperados, ele aborta em vez
+de aplicar o patch errado.
