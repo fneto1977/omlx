@@ -363,3 +363,25 @@ PRs enviados ao `jundot/omlx`:
 - [#4495](https://github.com/jundot/omlx/pull/4495) — DFlash2 sem `num_target_layers`.
 - [#4496](https://github.com/jundot/omlx/pull/4496) — kernels e rotas de atenção M1 (rascunho,
   acima de 1.000 linhas; escopo declarado: M1 Max 64 GB e os três modelos acima).
+
+## Rodada 2 — depois da limpeza das ventoinhas (2026-10-13)
+
+Ambiente: modo de energia "Alto desempenho", ventoinhas limpas, modelos oQ4e novos (Qwen3.6
+convertido para fp16; Qwen3.8 fp16 do Hugging Face).
+
+| # | Teste | Resultado | Decisão |
+|---|---|---|---|
+| 1 | Qwen3.8 depois da limpeza | decode curto 35–36 tok/s (ontem à noite 15–24 no mesmo pedido); 3 gerações longas seguidas 24,2 / 24,2 / 23,7 tok/s, sem queda térmica | manter "Alto desempenho" |
+| 2 | `ane_compile_cache` | carga do Qwen3.8 52 s → 32 s (−38%) | **ligado** |
+| 3 | Limites de memória | o teto que vale é o do Metal (51,8 GB, padrão da Apple); subir `iogpu.wired_limit_mb` + teto do oMLX a 56 GB não segurou a ANE (a estimativa por bloco cresce com o contexto) e levou o macOS a 5 GB de swap | **não usar**; teto de volta a 52 GB |
+| 3b | Bloco mínimo de prefill 2048 (oMLX usa 4096 em hosts ≥64 GB sem NAX) | Qwen3.8 com ANE: 15k 127 → 157 tok/s (+24%), 61k 121 → 133 tok/s (+10%); Qwen3.6: −1 a −2% (ruído) | **padrão** no `m1_serve.sh` (`OMLX_QWEN35_PREFILL_FLOOR=2048`) |
+| 4 | Kernel de verificação 5 bits | 21% dos bytes do Qwen3.8 são 5 bits; teto de ganho ~2–3 ms por ciclo de ~130 ms (2–3%); `mma` existente é 70% mais lento que o `sg8` atual | **no-go** |
+| 5 | ANE no prefill do Qwen3.6-35B (MoE) | 15k 979 → 975 tok/s, 61k 599 → 604 tok/s (só as projeções GDN vão para a ANE; os experts dominam) | **no-go**, ANE desligada no 35B |
+
+Correção encontrada: `python -m` põe a pasta atual na frente do `sys.path`; iniciado de dentro do
+checkout do repositório, o `m1_serve.sh` carregava o código do repositório (sem extensões
+nativas → "Private ANE runtime unavailable"). Corrigido com `PYTHONSAFEPATH=1`.
+
+Pendência conhecida: depois que a ANE é liberada por falta de folga (acima de ~50k de contexto no
+Qwen3.8), ela só volta quando o modelo é recarregado. A estimativa de memória por bloco usa o
+máximo medido × margem de segurança; ajustá-la mexe na proteção contra falta de memória do oMLX.

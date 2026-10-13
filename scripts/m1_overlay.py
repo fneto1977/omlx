@@ -209,6 +209,22 @@ def _verify_attn_edits() -> list:
     ]
 
 
+# Qwen3.5-family prefill floor (4096 on >=64 GB non-NAX hosts) made settable:
+# on M1 Max 4096-token chunks double the throttle's per-chunk charge, which
+# sheds the ANE prefill banks on the first long prompt.
+_SCHEDULER_EDITS = [
+    (
+        '        """Return the wide-prefill floor for Qwen/GLM hybrid architectures."""\n'
+        "        try:\n",
+        '        """Return the wide-prefill floor for Qwen/GLM hybrid architectures."""\n'
+        '        override = os.environ.get("OMLX_QWEN35_PREFILL_FLOOR", "").strip()\n'
+        "        if override.isdigit():\n"
+        "            return int(override)\n"
+        "        try:\n",
+    ),
+]
+
+
 def _apply(path: Path, edits) -> None:
     text = path.read_text()
     for edit in edits:
@@ -251,6 +267,7 @@ def main() -> None:
     _apply(staging / "patches" / "qwen35_fa256_attention.py", _FA256_EDITS + _fa256_m1_edits())
     _apply(staging / "speculative" / "dflash_drafter.py", _dflash_edits())
     _apply(staging / "patches" / "qwen35_verify_sdpa_split.py", _verify_attn_edits())
+    _apply(staging / "scheduler.py", _SCHEDULER_EDITS)
     hardware = staging / "utils" / "hardware.py"
     if "def get_apple_gpu_generation" not in hardware.read_text():
         hardware.write_text(hardware.read_text() + _hardware_helper())

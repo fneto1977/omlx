@@ -16,8 +16,15 @@ fi
 
 export PYTHONHOME="$CPYTHON"
 export PYTHONDONTWRITEBYTECODE=1
+# `python -m` puts the current directory first on sys.path; run from a source
+# checkout that would import its omlx (no native kernels, so no ANE prefill)
+# instead of the overlay.
+export PYTHONSAFEPATH=1
 export PYTHONPATH="$OVERLAY:$MLX_SITE"
 # Steel FA-256 key tile: 16 measured faster than the default 8 on M1 Max.
 export OMLX_FA256_K_BLOCK="${OMLX_FA256_K_BLOCK:-16}"
+# Qwen3.5-family prefill chunks of 2048 (upstream floor 4096 on this host) keep
+# the ANE prefill banks: +24% prefill at 15k, +10% at 61k on Qwen3.8-27B.
+export OMLX_QWEN35_PREFILL_FLOOR="${OMLX_QWEN35_PREFILL_FLOOR:-2048}"
 
 exec "$CPYTHON/bin/python3" -m omlx.cli serve "$@"
