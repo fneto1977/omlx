@@ -426,3 +426,19 @@ Conclusões:
 
 Decisão: **ANE desligada no Qwen3.8**. Libera ~11 GB, carga de 27–52 s → 5–8 s, decode 35–40 tok/s,
 e a proteção de memória deixa de interferir no prefill.
+
+## Qwen3.8 Flash Next (oQ2.5e-fp16-mtp) — teste (2026-10-13)
+
+125B parâmetros / ~6B ativos + tabela de n-gramas de 51B (32 GB, servida do SSD externo).
+Teste com teto do oMLX em 58 GB e `iogpu.wired_limit_mb=62259`, nenhum outro modelo carregado.
+
+| | Flash Next oQ2.5e | Qwen3.6-35B-A3B | Qwen3.8-27B |
+|---|---|---|---|
+| Memória do modelo | 48,2 GB (sistema com 4–7% livre, swap 8,5 GB) | ~20 GB | ~17,5 GB |
+| Carga | 68 s | ~10 s | 5–8 s |
+| Decode, código curto (MTP 88% de acerto) | **12,3–12,8 tok/s** | 85–91 tok/s | 35–40 tok/s |
+| Prefill 8k | **91 tok/s** (blocos reduzidos a 512 por falta de memória) | ~980 tok/s (15k) | 157 tok/s (15k) |
+
+O próprio oMLX avisa que, com os n-gramas no SSD, o decode fica ~2,5× mais lento que com tudo na
+memória, e mesmo assim o modelo precisa de 54,4 GB. **No-go** em 64 GB: 7× mais lento que o
+Qwen3.6 no decode e 10× no prefill, com o sistema em swap. Teto de volta a 52 GB.
