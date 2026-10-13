@@ -385,3 +385,44 @@ nativas → "Private ANE runtime unavailable"). Corrigido com `PYTHONSAFEPATH=1`
 Pendência conhecida: depois que a ANE é liberada por falta de folga (acima de ~50k de contexto no
 Qwen3.8), ela só volta quando o modelo é recarregado. A estimativa de memória por bloco usa o
 máximo medido × margem de segurança; ajustá-la mexe na proteção contra falta de memória do oMLX.
+
+## Proteção de memória do prefill — análise (2026-10-13)
+
+Como o oMLX decide (`scheduler.py`, throttle adaptativo):
+
+- `current` = maior entre memória ativa do MLX e `phys_footprint` do processo (inclui o pool de
+  buffers do MLX e os bancos da ANE).
+- Transiente previsto do próximo bloco = maior entre estimativa estática, média móvel e **último
+  bloco medido**, vezes **1,3**.
+- Alvo = 90% do limite (no M1 Max, o limite efetivo é o teto do Metal, 51,8 GB → alvo 48,9 GB).
+- Se `current + previsto > alvo`, libera recursos (primeiro outros modelos, depois os bancos da
+  ANE, que só voltam quando o modelo é recarregado) e depois reduz o bloco.
+
+Medições com log de depuração (Qwen3.8, blocos de 2048):
+
+| Situação | Transiente por bloco |
+|---|---|
+| Bloco que roda na ANE | **10,4 GB** (pico real de memória ativa) |
+| Mesmo bloco só na GPU | 2,9 GB |
+| Blocos seguintes, medição original (ativa + pool) | 3,3–4,3 GB, depois ~2,06 GB (= limite de 2 GiB do pool imposto pela rota de atenção M1) |
+| Blocos seguintes, medição por pico | ~2,6 GB estável de 2k a 37k |
+
+Conclusões:
+
+1. A proteção **não estava errada** no caso que derrubava a ANE: o caminho da ANE realmente usa
+   ~7,5 GB a mais por bloco, além de ~11 GB fixos dos bancos.
+2. Há uma falha secundária real: a medição soma o pool do MLX, que já está em `current` (contagem
+   dupla). A troca por pico de memória ativa está no overlay atrás de
+   `OMLX_PREFILL_PEAK_ACCOUNTING=1` (desligada por padrão: com a ANE desligada não faz diferença
+   prática, e mexe na proteção contra falta de memória).
+3. **No M1 Max a ANE não acelera o prefill do Qwen3.8** quando os blocos são de 2048:
+
+| Qwen3.8, blocos de 2048 | 15k | 61k |
+|---|---|---|
+| ANE ligada (enquanto não liberada) | 157 tok/s | 133 tok/s |
+| ANE desligada | 157 tok/s | 129 tok/s |
+
+   O ganho de +24% medido antes veio do bloco de 2048, não da ANE.
+
+Decisão: **ANE desligada no Qwen3.8**. Libera ~11 GB, carga de 27–52 s → 5–8 s, decode 35–40 tok/s,
+e a proteção de memória deixa de interferir no prefill.

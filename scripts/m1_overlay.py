@@ -222,6 +222,39 @@ _SCHEDULER_EDITS = [
         "            return int(override)\n"
         "        try:\n",
     ),
+    # Price a prefill chunk by its peak live memory instead of live + MLX pool.
+    # The pool is already in the guard's `current` (phys footprint), so adding
+    # it again charges every chunk the whole pool: the first chunk's pool fill
+    # (~10.7 GB on Qwen3.8) then sheds the ANE banks at 2k context.
+    (
+        "logger = logging.getLogger(__name__)\n",
+        "logger = logging.getLogger(__name__)\n\n"
+        '_PREFILL_PEAK_ACCOUNTING = os.environ.get("OMLX_PREFILL_PEAK_ACCOUNTING") == "1"\n',
+    ),
+    (
+        "\n            _pre_active, _, _pre_cpu = Scheduler._chunk_memory_sample()\n",
+        "\n            _pre_active, _, _pre_cpu = Scheduler._chunk_memory_sample()\n"
+        "            if _PREFILL_PEAK_ACCOUNTING:\n"
+        "                mx.reset_peak_memory()\n",
+    ),
+    (
+        "\n        _pre_active, _, _pre_cpu = Scheduler._chunk_memory_sample()\n",
+        "\n        _pre_active, _, _pre_cpu = Scheduler._chunk_memory_sample()\n"
+        "        if _PREFILL_PEAK_ACCOUNTING:\n"
+        "            mx.reset_peak_memory()\n",
+    ),
+    (
+        "\n            _, _post_total, _post_cpu = Scheduler._chunk_memory_sample()\n",
+        "\n            _, _post_total, _post_cpu = Scheduler._chunk_memory_sample()\n"
+        "            if _PREFILL_PEAK_ACCOUNTING:\n"
+        "                _post_total = max(_pre_active, int(mx.get_peak_memory()))\n",
+    ),
+    (
+        "\n        _, _post_total, _post_cpu = Scheduler._chunk_memory_sample()\n",
+        "\n        _, _post_total, _post_cpu = Scheduler._chunk_memory_sample()\n"
+        "        if _PREFILL_PEAK_ACCOUNTING:\n"
+        "            _post_total = max(_pre_active, int(mx.get_peak_memory()))\n",
+    ),
 ]
 
 
