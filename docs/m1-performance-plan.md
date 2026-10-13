@@ -374,7 +374,7 @@ convertido para fp16; Qwen3.8 fp16 do Hugging Face).
 | 1 | Qwen3.8 depois da limpeza | decode curto 35–36 tok/s (ontem à noite 15–24 no mesmo pedido); 3 gerações longas seguidas 24,2 / 24,2 / 23,7 tok/s, sem queda térmica | manter "Alto desempenho" |
 | 2 | `ane_compile_cache` | carga do Qwen3.8 52 s → 32 s (−38%) | **ligado** |
 | 3 | Limites de memória | o teto que vale é o do Metal (51,8 GB, padrão da Apple); subir `iogpu.wired_limit_mb` + teto do oMLX a 56 GB não segurou a ANE (a estimativa por bloco cresce com o contexto) e levou o macOS a 5 GB de swap | **não usar**; teto de volta a 52 GB |
-| 3b | Bloco mínimo de prefill 2048 (oMLX usa 4096 em hosts ≥64 GB sem NAX) | Qwen3.8 com ANE: 15k 127 → 157 tok/s (+24%), 61k 121 → 133 tok/s (+10%); Qwen3.6: −1 a −2% (ruído) | **padrão** no `m1_serve.sh` (`OMLX_QWEN35_PREFILL_FLOOR=2048`) |
+| 3b | Bloco mínimo de prefill 2048 (oMLX usa 4096 em hosts ≥64 GB sem NAX) | ~~+24%~~ — corrigido: o 127 tok/s de 4096 foi uma execução em que a ANE rodou o 1º bloco e foi liberada. Medição limpa só na GPU: Qwen3.8 152 → 157 (15k, +3%), 124 → 129 (61k, +4%); Qwen3.6 −1 a −2% | mantido no `m1_serve.sh` (neutro); **sem PR** |
 | 4 | Kernel de verificação 5 bits | 21% dos bytes do Qwen3.8 são 5 bits; teto de ganho ~2–3 ms por ciclo de ~130 ms (2–3%); `mma` existente é 70% mais lento que o `sg8` atual | **no-go** |
 | 5 | ANE no prefill do Qwen3.6-35B (MoE) | 15k 979 → 975 tok/s, 61k 599 → 604 tok/s (só as projeções GDN vão para a ANE; os experts dominam) | **no-go**, ANE desligada no 35B |
 
@@ -442,3 +442,24 @@ Teste com teto do oMLX em 58 GB e `iogpu.wired_limit_mb=62259`, nenhum outro mod
 O próprio oMLX avisa que, com os n-gramas no SSD, o decode fica ~2,5× mais lento que com tudo na
 memória, e mesmo assim o modelo precisa de 54,4 GB. **No-go** em 64 GB: 7× mais lento que o
 Qwen3.6 no decode e 10× no prefill, com o sistema em swap. Teto de volta a 52 GB.
+
+## Ajuste de MTP e DFlash2 com as quantizações oQ4e (2026-10-13)
+
+Um modelo por vez na memória, amostragem configurada de cada modelo, 2 execuções por tarefa
+("escrever" = código novo, 1500 tokens; "editar" = devolver um arquivo de ~230 linhas com uma
+renomeação, ~3–4k tokens). tok/s:
+
+| Modelo | Variação | Escrever | Editar |
+|---|---|---|---|
+| Qwen3.6-35B-A3B | **adaptativo (≤3)** | **83,1** | **85,7** |
+| | fixo 2 / 3 / 4 | 71,4 / 77,1 / 76,9 | 78,8 / 85,6 / 78,8 |
+| Gemma 4 26B | **adaptativo (≤3)** | 52,4 | 58,0 |
+| | fixo 2 / 3 | 52,9 / 52,4 | 55,6 / 60,6 |
+| Qwen3.8-27B (DFlash2) | bloco 6 / **8** / 10 | 29,3 / **32,5** / 29,2 | 33,7 / **34,8** / 32,0 |
+
+Decisão: Qwen3.6 volta ao MTP adaptativo (o fixo 3 tinha sido escolhido com a quantização oQ4
+antiga); Gemma adaptativo (fixo 3 +4% só na edição, dentro do ruído); Qwen3.8 bloco 8.
+
+Bloco de prefill: com a ANE desligada o ganho de 2048 sobre 4096 é de 3–4% no Qwen3.8 e −1 a
+−2% no Qwen3.6 — insuficiente para um PR. A análise da proteção de memória (contagem dupla do pool,
+medição por pico) foi publicada como comentário em jundot/omlx#4057.
