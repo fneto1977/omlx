@@ -506,6 +506,10 @@ class DFlashDrafter:
         anchors = mx.concatenate([anchor for _, _, _, anchor, _ in rows]).astype(
             mx.int32
         )
+        # DSpark (sample_from_anchor): the anchor slot proposes the first
+        # token, so the block holds anchor + block-2 masks and keeps every row.
+        anchor_slot = _dspark_anchor_slot(model)
+        block = block - 1 if anchor_slot else block
         masks = mx.full(
             (batch, block - 1), int(model.config.mask_token_id), dtype=mx.int32
         )
@@ -614,11 +618,14 @@ class DFlashDrafter:
             ):
                 row.fed = b + n
 
-        draft_hidden = model.norm(h)[:, 1:]
+        draft_hidden = model.norm(h) if anchor_slot else model.norm(h)[:, 1:]
         logits = model._logits(draft_hidden)
         samplers = [sampler for *_, sampler in rows]
         selector = getattr(model, "candidate_selector", None)
-        if selector is not None and _fused_select_eligible(selector, draft_hidden):
+        markov = _dspark_markov(model)
+        if markov is not None:
+            proposals = _select_markov(markov, logits, anchors, samplers)
+        elif selector is not None and _fused_select_eligible(selector, draft_hidden):
             proposals = _select_fused(selector, draft_hidden, logits, anchors, samplers)
         elif all(sampler is None for sampler in samplers):
             if selector is not None:
@@ -645,6 +652,52 @@ class DFlashDrafter:
                 proposals=proposals,
             )
         return proposals
+
+
+def _dspark_markov(model: nn.Module):
+    """The Markov head of a DSpark drafter (None for DFlash and DFlash2)."""
+    return getattr(model, "markov_head", None)
+
+
+def _dspark_anchor_slot(model: nn.Module) -> bool:
+    return _dspark_markov(model) is not None and bool(
+        getattr(model.config, "sample_from_anchor", False)
+    )
+
+
+def _select_markov(
+    markov, logits: mx.array, anchors: mx.array, samplers: list
+) -> list[tuple]:
+    """DSpark proposals: each position's logits plus the Markov head's
+    transition from the previous token, chosen left to right."""
+    batch, length = int(logits.shape[0]), int(logits.shape[1])
+    if all(sampler is None for sampler in samplers):
+        prev = anchors.reshape(-1).astype(mx.int32)
+        picks = []
+        for step in range(length):
+            prev = mx.argmax(markov.apply_step_logits(logits[:, step], prev), axis=-1)
+            prev = prev.astype(mx.int32)
+            picks.append(prev[:, None])
+        tokens = mx.concatenate(picks, axis=1)
+        return [(tokens[i : i + 1], []) for i in range(batch)]
+    out = []
+    for index, sampler in enumerate(samplers):
+        prev = anchors[index : index + 1].reshape(-1).astype(mx.int32)
+        tokens, accept = [], []
+        for step in range(length):
+            step_logits = markov.apply_step_logits(
+                logits[index : index + 1, step], prev
+            )
+            if sampler is None:
+                prev = mx.argmax(step_logits, axis=-1).astype(mx.int32)
+            else:
+                lp = step_logits - mx.logsumexp(step_logits, axis=-1, keepdims=True)
+                token, accept_lp = bg._sample_draft_with_logprobs(sampler, lp)
+                prev = token.reshape(-1).astype(mx.int32)
+                accept.append(accept_lp.reshape(-1))
+            tokens.append(prev.reshape(1))
+        out.append((mx.concatenate(tokens)[None], accept))
+    return out
 
 
 def _sample_positions(logits: mx.array, samplers: list) -> list[tuple]:
