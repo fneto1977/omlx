@@ -463,3 +463,28 @@ antiga); Gemma adaptativo (fixo 3 +4% só na edição, dentro do ruído); Qwen3.
 Bloco de prefill: com a ANE desligada o ganho de 2048 sobre 4096 é de 3–4% no Qwen3.8 e −1 a
 −2% no Qwen3.6 — insuficiente para um PR. A análise da proteção de memória (contagem dupla do pool,
 medição por pico) foi publicada como comentário em jundot/omlx#4057.
+
+## lithos-metal e DSpark (2026-10-14)
+
+[lithos-metal](https://github.com/lithos-ai/lithos-metal): motor próprio (megakernels por camada,
+controle da geração na GPU via ICB, pesos NVFP4, drafter DSpark). Só tem backends para Apple9/Apple10
+(M3–M5) e assume a alocação dinâmica de memória on-chip do M3 — **não roda no M1**. Das ideias, só o
+drafter DSpark se aplica ao oMLX.
+
+DSpark no oMLX: o mlx-vlm carrega drafters DSpark como tipo "dflash", mas o laço em lote do oMLX
+montava o bloco errado (âncora + block−1 máscaras, linha da âncora descartada; o DSpark usa
+`sample_from_anchor`) e ignorava o Markov head. Corrigido (`_dspark_anchor_slot`, `_select_markov`;
+no overlay via `m1_overlay.py`; branch `fix/dflash-dspark-markov` no fork).
+
+Qwen3.8-27B, drafter `RadixArk/Qwen3.8-27B-DSpark` (4 bits, bloco 8), amostragem do modelo, um modelo
+carregado:
+
+| | Aceitação | Tokens/ciclo (escrever / editar) | tok/s (escrever / editar) | Rascunho/ciclo |
+|---|---|---|---|---|
+| DSpark no oMLX original | 9–15% | 1,17 / 1,10 | 8,2 / 7,6 | ~40 ms |
+| DSpark corrigido | 75–80% | 4,1 / 3,6 | 25 / 23 | ~80 ms |
+| DSpark corrigido, drafter sem quantizar | 75–80% | 4,2 / 3,6 | 18,7 / 16,1 | ~200 ms |
+| **DFlash2 (incoai), bloco 8** | 82–86% | 4,5 / 5,25 | **31 / 36** | ~16 ms |
+
+Decisão: **mantido o DFlash2** no Qwen3.8 (DSpark acerta menos e rascunha 5× mais devagar no M1).
+A correção do DSpark é um bug real do oMLX (independente do hardware) — candidata a PR.

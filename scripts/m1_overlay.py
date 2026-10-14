@@ -258,6 +258,93 @@ _SCHEDULER_EDITS = [
 ]
 
 
+# DSpark drafters (mlx-vlm loads them as kind "dflash") need two things the
+# batched DFlash round loop lacks: with sample_from_anchor the anchor slot
+# yields the first proposal (anchor + block-2 masks, every position kept), and
+# the Markov head's low-rank transition picks proposals left to right.
+_DSPARK_EDITS = [
+    (
+        "import logging\nimport math\nimport time\n",
+        "import logging\nimport math\nimport os\nimport time\n",
+    ),
+    (
+        "        masks = mx.full(\n"
+        "            (batch, block - 1), int(model.config.mask_token_id), dtype=mx.int32\n"
+        "        )\n",
+        "        # DSpark (sample_from_anchor): the anchor slot proposes the first\n"
+        "        # token, so the block holds anchor + block-2 masks and keeps every row.\n"
+        "        anchor_slot = _dspark_anchor_slot(model)\n"
+        "        block = block - 1 if anchor_slot else block\n"
+        "        masks = mx.full(\n"
+        "            (batch, block - 1), int(model.config.mask_token_id), dtype=mx.int32\n"
+        "        )\n",
+    ),
+    (
+        "        draft_hidden = model.norm(h)[:, 1:]\n"
+        "        logits = model._logits(draft_hidden)\n"
+        "        samplers = [sampler for *_, sampler in rows]\n"
+        "        selector = getattr(model, \"candidate_selector\", None)\n"
+        "        if selector is not None and _fused_select_eligible(selector, draft_hidden):\n",
+        "        draft_hidden = model.norm(h) if anchor_slot else model.norm(h)[:, 1:]\n"
+        "        logits = model._logits(draft_hidden)\n"
+        "        samplers = [sampler for *_, sampler in rows]\n"
+        "        selector = getattr(model, \"candidate_selector\", None)\n"
+        "        markov = _dspark_markov(model)\n"
+        "        if markov is not None:\n"
+        "            proposals = _select_markov(markov, logits, anchors, samplers)\n"
+        "        elif selector is not None and _fused_select_eligible(selector, draft_hidden):\n",
+    ),
+    (
+        "def _sample_positions(logits: mx.array, samplers: list) -> list[tuple]:\n",
+        "def _dspark_markov(model: nn.Module):\n"
+        "    \"\"\"The DSpark Markov head, unless OMLX_DSPARK_MARKOV=0 (stock DFlash path).\"\"\"\n"
+        "    if os.environ.get(\"OMLX_DSPARK_MARKOV\", \"1\") == \"0\":\n"
+        "        return None\n"
+        "    return getattr(model, \"markov_head\", None)\n"
+        "\n"
+        "\n"
+        "def _dspark_anchor_slot(model: nn.Module) -> bool:\n"
+        "    return _dspark_markov(model) is not None and bool(\n"
+        "        getattr(model.config, \"sample_from_anchor\", False)\n"
+        "    )\n"
+        "\n"
+        "\n"
+        "def _select_markov(markov, logits: mx.array, anchors: mx.array, samplers: list) -> list[tuple]:\n"
+        "    \"\"\"DSpark proposals: each position's logits plus the Markov head's\n"
+        "    transition from the previous token, chosen left to right.\"\"\"\n"
+        "    batch, length = int(logits.shape[0]), int(logits.shape[1])\n"
+        "    if all(sampler is None for sampler in samplers):\n"
+        "        prev = anchors.reshape(-1).astype(mx.int32)\n"
+        "        picks = []\n"
+        "        for step in range(length):\n"
+        "            prev = mx.argmax(markov.apply_step_logits(logits[:, step], prev), axis=-1)\n"
+        "            prev = prev.astype(mx.int32)\n"
+        "            picks.append(prev[:, None])\n"
+        "        tokens = mx.concatenate(picks, axis=1)\n"
+        "        return [(tokens[i : i + 1], []) for i in range(batch)]\n"
+        "    out = []\n"
+        "    for index, sampler in enumerate(samplers):\n"
+        "        prev = anchors[index : index + 1].reshape(-1).astype(mx.int32)\n"
+        "        tokens, accept = [], []\n"
+        "        for step in range(length):\n"
+        "            step_logits = markov.apply_step_logits(logits[index : index + 1, step], prev)\n"
+        "            if sampler is None:\n"
+        "                prev = mx.argmax(step_logits, axis=-1).astype(mx.int32)\n"
+        "            else:\n"
+        "                lp = step_logits - mx.logsumexp(step_logits, axis=-1, keepdims=True)\n"
+        "                token, accept_lp = bg._sample_draft_with_logprobs(sampler, lp)\n"
+        "                prev = token.reshape(-1).astype(mx.int32)\n"
+        "                accept.append(accept_lp.reshape(-1))\n"
+        "            tokens.append(prev.reshape(1))\n"
+        "        out.append((mx.concatenate(tokens)[None], accept))\n"
+        "    return out\n"
+        "\n"
+        "\n"
+        "def _sample_positions(logits: mx.array, samplers: list) -> list[tuple]:\n",
+    ),
+]
+
+
 def _apply(path: Path, edits) -> None:
     text = path.read_text()
     for edit in edits:
@@ -298,7 +385,7 @@ def main() -> None:
         shutil.copy2(REPO / "omlx" / "patches" / module, staging / "patches")
     _apply(staging / "patches" / "qwen35_verify_qmm.py", _VERIFY_EDITS)
     _apply(staging / "patches" / "qwen35_fa256_attention.py", _FA256_EDITS + _fa256_m1_edits())
-    _apply(staging / "speculative" / "dflash_drafter.py", _dflash_edits())
+    _apply(staging / "speculative" / "dflash_drafter.py", _dflash_edits() + _DSPARK_EDITS)
     _apply(staging / "patches" / "qwen35_verify_sdpa_split.py", _verify_attn_edits())
     _apply(staging / "scheduler.py", _SCHEDULER_EDITS)
     hardware = staging / "utils" / "hardware.py"
