@@ -213,13 +213,18 @@ def _thinking_close_pattern(
     if not template:
         return None, None
     template = template if isinstance(template, str) else str(template)
-    match = re.search(
-        r"(\\n|\\r|[\n\r])*" + re.escape(think_end_text) + r"((?:\\n|\\r|[\n\r])*)",
-        template,
+    matches = list(
+        re.finditer(
+            r"(\\n|\\r|[\n\r])*" + re.escape(think_end_text) + r"((?:\\n|\\r|[\n\r])*)",
+            template,
+        )
     )
-    if match is None:
+    if not matches:
         return None, None
-    matched = match.group(0)
+    matched = next(
+        (m.group(0) for m in matches if m.group(0) != think_end_text),
+        matches[0].group(0),
+    )
     leading, trailing = matched.split(think_end_text, 1)
     leading = leading.replace("\\n", "\n").replace("\\r", "\r")
     trailing = trailing.replace("\\n", "\n").replace("\\r", "\r")

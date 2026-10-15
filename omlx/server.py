@@ -127,6 +127,7 @@ from .api.openai_models import (
     CompletionChoice,
     CompletionRequest,
     CompletionResponse,
+    CompletionTokensDetails,
     DetokenizeRequest,
     DetokenizeResponse,
     ModelInfo,
@@ -1998,6 +1999,14 @@ def _resolve_thinking_budget(request, model_id: str | None) -> int | None:
     if ms and ms.thinking_budget_enabled and ms.thinking_budget_tokens:
         return ms.thinking_budget_tokens
     return None
+
+
+def _no_repeat_ngram_kwargs(request) -> dict[str, int]:
+    size = getattr(request, "no_repeat_ngram_size", None)
+    if not size:
+        return {}
+    window = getattr(request, "ngram_window", None) or 0
+    return {"no_repeat_ngram_size": size, "ngram_window": window}
 
 
 def get_model_settings_for_request(model_id: str | None):
@@ -4395,6 +4404,7 @@ async def create_completion(
             )
             if repetition_context_size is not None:
                 gen_kwargs["repetition_context_size"] = repetition_context_size
+            gen_kwargs.update(_no_repeat_ngram_kwargs(request))
 
             # First prompt's first-token timestamp only: later prompts start
             # after earlier generations, so their first_token_at would count
@@ -4553,10 +4563,7 @@ def _extract_chat_messages(
             else None
         ),
     )
-    is_vlm = isinstance(engine, VLMBatchedEngine)
-    is_dflash_vlm = not is_vlm and getattr(
-        engine, "supports_multimodal_fallback", False
-    )
+    is_vlm = _engine_accepts_images(engine)
     extractor = getattr(engine, "message_extractor", None)
     if extractor is not None:
         extractor_kwargs = {}
@@ -4571,8 +4578,8 @@ def _extract_chat_messages(
             engine.tokenizer,
             **extractor_kwargs,
         )
-    elif is_vlm or is_dflash_vlm:
-        # VLM or DFlash with VLM fallback: preserve image_url content parts
+    elif is_vlm:
+        # VLM: preserve image_url content parts
         messages = extract_multimodal_content(
             request.messages,
             max_tool_result_tokens,
@@ -4597,6 +4604,17 @@ def _extract_chat_messages(
         messages=messages,
         is_partial=is_partial,
         native_reasoning=native_reasoning,
+    )
+
+
+def _engine_accepts_images(engine: BaseEngine) -> bool:
+    """Whether image content parts should reach ``engine``.
+
+    In-process VLMs read them, and an external engine can declare it (Splash
+    serving a checkpoint with a vision tower). Other engines get text only.
+    """
+    return isinstance(engine, VLMBatchedEngine) or bool(
+        getattr(engine, "accepts_image_input", False)
     )
 
 
@@ -4867,6 +4885,7 @@ async def create_chat_completion(
         )
         if repetition_context_size is not None:
             chat_kwargs["repetition_context_size"] = repetition_context_size
+        chat_kwargs.update(_no_repeat_ngram_kwargs(request))
 
         # Add seed for reproducible generation (best-effort)
         if request.seed is not None:
@@ -5033,7 +5052,12 @@ async def create_chat_completion(
             # Separate thinking from content
             raw_text = clean_special_tokens(output.text) if output.text else ""
             thinking_content, regular_content = extract_thinking(
-                raw_text, truncated=output.finish_reason == "length"
+                raw_text,
+                truncated=output.finish_reason == "length",
+                start_in_thinking=(
+                    output.finish_reason == "length"
+                    and _chat_prompt_opens_thinking(engine, messages, chat_kwargs)
+                ),
             )
             cleaned_thinking = sanitize_tool_call_markup(
                 thinking_content, engine.tokenizer
@@ -5086,6 +5110,11 @@ async def create_chat_completion(
                             pass
 
             finish_reason = "tool_calls" if tool_calls else output.finish_reason
+            reasoning_token_count = (
+                len(engine.tokenizer.encode(cleaned_thinking))
+                if cleaned_thinking
+                else 0
+            )
 
             return ChatCompletionResponse(
                 model=request.model,
@@ -5107,6 +5136,9 @@ async def create_chat_completion(
                     total_tokens=output.prompt_tokens + output.completion_tokens,
                     prompt_tokens_details=PromptTokensDetails(
                         cached_tokens=output.cached_tokens,
+                    ),
+                    completion_tokens_details=CompletionTokensDetails(
+                        reasoning_tokens=reasoning_token_count,
                     ),
                     model_load_duration=(
                         round(model_load_duration, 2)
@@ -5695,6 +5727,7 @@ async def stream_completion(
     )
     if repetition_context_size is not None:
         gen_kwargs["repetition_context_size"] = repetition_context_size
+    gen_kwargs.update(_no_repeat_ngram_kwargs(request))
     outputs = engine.stream_generate(
         prompt=prompt,
         max_tokens=max_tokens,
@@ -5908,6 +5941,27 @@ def _render_chat_prompt_for_thinking_detection(
     return str(prompt), None
 
 
+def _chat_prompt_opens_thinking(
+    engine: BaseEngine,
+    messages: list,
+    kwargs: dict,
+) -> bool:
+    tokenizer = getattr(engine, "tokenizer", None)
+    if tokenizer is None:
+        return False
+    try:
+        prompt, prompt_token_ids = _render_chat_prompt_for_thinking_detection(
+            engine, messages, kwargs
+        )
+        opened, _ = prompt_opens_thinking(
+            tokenizer, prompt, prompt_token_ids=prompt_token_ids
+        )
+    except Exception as exc:
+        logger.debug("Could not detect chat prompt thinking state: %s", exc)
+        return False
+    return opened
+
+
 class _ToolCallGenerationError(HTTPException):
     """Keep generation failure codes through JSON keepalive responses."""
 
@@ -6095,6 +6149,7 @@ async def stream_chat_completion(
     first_visible_time = None
     last_output = None
     accumulated_text = ""
+    accumulated_reasoning = ""
     has_tools = bool(kwargs.get("tools"))
     start_in_thinking = False
     try:
@@ -6234,6 +6289,7 @@ async def stream_chat_completion(
                         ],
                     )
                     if thinking_delta:
+                        accumulated_reasoning += thinking_delta
                         event = (
                             f"data: {chunk.model_dump_json(exclude_none=True)}\n\n"
                         )
@@ -6361,12 +6417,14 @@ async def stream_chat_completion(
     # Flush remaining buffered content from thinking/tool-call parsers
     if stream_content:
         thinking_delta, content_delta = thinking_parser.finish(
-            truncated=last_output is not None and last_output.finish_reason == "length"
+            truncated=last_output is not None and last_output.finish_reason == "length",
+            has_tool_calls=bool(last_output and last_output.tool_calls),
         )
         if thinking_delta:
             if thinking_filter:
                 thinking_delta = thinking_filter.feed(thinking_delta)
             if thinking_delta:
+                accumulated_reasoning += thinking_delta
                 chunk = ChatCompletionChunk(
                     id=response_id,
                     model=request.model,
@@ -6385,6 +6443,7 @@ async def stream_chat_completion(
         if thinking_filter:
             remaining_thinking = thinking_filter.finish()
             if remaining_thinking:
+                accumulated_reasoning += remaining_thinking
                 chunk = ChatCompletionChunk(
                     id=response_id,
                     model=request.model,
@@ -6516,6 +6575,7 @@ async def stream_chat_completion(
         tool_failure = None
     if not tool_calls and not tool_failure:
         if recovered_thinking:
+            accumulated_reasoning += recovered_thinking
             chunk = ChatCompletionChunk(
                 id=response_id,
                 model=request.model,
@@ -6716,6 +6776,11 @@ async def stream_chat_completion(
             total_time = end_time - start_time
             pt = last_output.prompt_tokens
             ct = last_output.completion_tokens
+            reasoning_token_count = (
+                len(engine.tokenizer.encode(accumulated_reasoning))
+                if accumulated_reasoning
+                else 0
+            )
             usage_chunk = ChatCompletionChunk(
                 id=response_id,
                 model=request.model,
@@ -6726,6 +6791,9 @@ async def stream_chat_completion(
                     total_tokens=pt + ct,
                     prompt_tokens_details=PromptTokensDetails(
                         cached_tokens=last_output.cached_tokens,
+                    ),
+                    completion_tokens_details=CompletionTokensDetails(
+                        reasoning_tokens=reasoning_token_count,
                     ),
                     model_load_duration=(
                         round(model_load_duration, 2)
@@ -6963,7 +7031,8 @@ async def stream_anthropic_messages(
 
     # Flush remaining buffered content from thinking parser
     thinking_delta, content_delta = thinking_parser.finish(
-        truncated=last_output is not None and last_output.finish_reason == "length"
+        truncated=last_output is not None and last_output.finish_reason == "length",
+        has_tool_calls=bool(last_output and last_output.tool_calls),
     )
     if thinking_delta:
         if thinking_filter:
@@ -7290,10 +7359,7 @@ async def create_anthropic_message(
 
         # Convert Anthropic format to internal format
         # Harmony models need special handling to preserve tool format
-        is_vlm = isinstance(engine, VLMBatchedEngine)
-        is_dflash_vlm = not is_vlm and getattr(
-            engine, "supports_multimodal_fallback", False
-        )
+        is_vlm = _engine_accepts_images(engine)
         native_reasoning = uses_native_reasoning_content(
             resolved_model,
             config_model_type=(
@@ -7320,7 +7386,7 @@ async def create_anthropic_message(
                 request,
                 max_tool_result_tokens,
                 engine.tokenizer,
-                preserve_images=is_vlm or is_dflash_vlm,
+                preserve_images=is_vlm,
                 native_reasoning_content=native_reasoning,
                 consolidate_system_messages=False,
             )
@@ -7572,7 +7638,12 @@ async def create_anthropic_message(
             # Separate thinking from content
             raw_text = clean_special_tokens(output.text) if output.text else ""
             thinking_content, regular_content = extract_thinking(
-                raw_text, truncated=output.finish_reason == "length"
+                raw_text,
+                truncated=output.finish_reason == "length",
+                start_in_thinking=(
+                    output.finish_reason == "length"
+                    and _chat_prompt_opens_thinking(engine, messages, chat_kwargs)
+                ),
             )
             cleaned_thinking = sanitize_tool_call_markup(
                 thinking_content, engine.tokenizer
@@ -7981,9 +8052,7 @@ async def create_response(
         # Images in function_call_output lists survive only for engines that
         # can extract them; text engines get a placeholder instead so base64
         # payloads never reach the prompt (#2989).
-        preserve_tool_images = isinstance(engine, VLMBatchedEngine) or getattr(
-            engine, "supports_multimodal_fallback", False
-        )
+        preserve_tool_images = _engine_accepts_images(engine)
 
         current_input_messages = convert_responses_input_to_messages(
             request.input,
@@ -8340,7 +8409,12 @@ async def create_response(
             # Process output text
             raw_text = clean_special_tokens(output.text) if output.text else ""
             thinking_content, regular_content = extract_thinking(
-                raw_text, truncated=output.finish_reason == "length"
+                raw_text,
+                truncated=output.finish_reason == "length",
+                start_in_thinking=(
+                    output.finish_reason == "length"
+                    and _chat_prompt_opens_thinking(engine, messages, chat_kwargs)
+                ),
             )
 
             # Parse tool calls
@@ -8838,7 +8912,8 @@ async def stream_responses_api(
     # Flush remaining content from parsers
     if stream_content:
         thinking_delta, content_delta = thinking_parser.finish(
-            truncated=last_output is not None and last_output.finish_reason == "length"
+            truncated=last_output is not None and last_output.finish_reason == "length",
+            has_tool_calls=bool(last_output and last_output.tool_calls),
         )
         if thinking_delta:
             if thinking_filter:

@@ -1458,6 +1458,45 @@ class TestChatCompletionEndpoint:
             assert "tools" not in recorded_chat_kwargs[0]
 
 
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize(
+    "text,reasoning_tokens",
+    [("<think>Need to reason.</think>Hello!", 3), ("Just an answer.", 0)],
+)
+def test_chat_usage_reports_reasoning_tokens(
+    client, mock_llm_engine, stream, text, reasoning_tokens
+):
+    output = MockGenerationOutput(text=text, new_text=text)
+    payload = {
+        "model": "test-model",
+        "messages": [{"role": "user", "content": "Hello"}],
+    }
+    if stream:
+
+        async def stream_chat(messages, **kwargs):
+            yield output
+
+        mock_llm_engine.stream_chat = stream_chat
+        payload["stream"] = True
+        payload["stream_options"] = {"include_usage": True}
+    else:
+        mock_llm_engine.chat = AsyncMock(return_value=output)
+
+    response = client.post("/v1/chat/completions", json=payload)
+
+    assert response.status_code == 200
+    if stream:
+        events = [
+            json.loads(line[6:])
+            for line in response.text.splitlines()
+            if line.startswith("data: {")
+        ]
+        usage = next(event["usage"] for event in events if event.get("usage"))
+    else:
+        usage = response.json()["usage"]
+    assert usage["completion_tokens_details"]["reasoning_tokens"] == reasoning_tokens
+
+
 class TestAnthropicMessagesEndpoint:
     """Tests for the /v1/messages endpoint (Anthropic format)."""
 
@@ -3080,11 +3119,19 @@ def test_structured_output_keeps_lone_surrogate_escape(client, mock_llm_engine, 
     assert content == model_text
 
 
+@pytest.mark.parametrize("prompt_opened", [False, True])
 @pytest.mark.parametrize("api", ["chat/completions", "messages", "responses"])
-def test_nonstream_thinking_length_channels(client, mock_llm_engine, api):
+def test_nonstream_thinking_length_channels(
+    client, mock_llm_engine, monkeypatch, api, prompt_opened
+):
+    if prompt_opened:
+        monkeypatch.setattr(
+            "omlx.server.prompt_opens_thinking", lambda *args, **kwargs: (True, "")
+        )
     mock_llm_engine.chat = AsyncMock(
         return_value=MockGenerationOutput(
-            text="<think>unfinished", finish_reason="length"
+            text="unfinished" if prompt_opened else "<think>unfinished",
+            finish_reason="length",
         )
     )
     body = {"model": "test-model", "max_tokens": 64}
