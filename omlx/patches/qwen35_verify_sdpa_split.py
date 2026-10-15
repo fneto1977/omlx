@@ -556,11 +556,23 @@ def _m1_gpu() -> bool:
     return get_apple_gpu_generation() == 13
 
 
-def _m1_gqa_chunk(kv_len: int, kv_heads: int) -> int:
+@functools.cache
+def _m1_gpu_cores() -> int:
+    """GPU core count of this M1-class chip (14/16 Pro, 24/32 Max, 48/64 Ultra).
+
+    Falls back to 32, the M1 Max the splits were tuned on, when it can't be read.
+    """
+    from omlx.utils.hardware import get_gpu_core_count
+
+    return get_gpu_core_count() or 32
+
+
+def _m1_gqa_chunk(kv_len: int, kv_heads: int, cores: int | None = None) -> int:
     """Keys per split on M1: about one threadgroup per GPU core (32 on an M1
-    Max), 1024..4096 keys. The 512-key splits tuned on M3 Ultra leave M1 7-21%
-    slower from 32k to 128k keys (measured on the 24/4 and 16/2 layouts)."""
-    chunk = -(-kv_len * kv_heads // 32)
+    Max, 64 on an M1 Ultra), 1024..4096 keys. The 512-key splits tuned on M3
+    Ultra leave M1 7-21% slower from 32k to 128k keys (measured on the 24/4
+    and 16/2 layouts)."""
+    chunk = -(-kv_len * kv_heads // (cores or _m1_gpu_cores()))
     return min(4096, max(1024, (chunk + 63) // 64 * 64))
 
 
