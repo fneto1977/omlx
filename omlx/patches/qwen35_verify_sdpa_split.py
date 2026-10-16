@@ -568,12 +568,21 @@ def _m1_gpu_cores() -> int:
 
 
 def _m1_gqa_chunk(kv_len: int, kv_heads: int, cores: int | None = None) -> int:
-    """Keys per split on M1: about one threadgroup per GPU core (32 on an M1
-    Max, 64 on an M1 Ultra), 1024..4096 keys. The 512-key splits tuned on M3
-    Ultra leave M1 7-21% slower from 32k to 128k keys (measured on the 24/4
-    and 16/2 layouts)."""
-    chunk = -(-kv_len * kv_heads // (cores or _m1_gpu_cores()))
-    return min(4096, max(1024, (chunk + 63) // 64 * 64))
+    """Keys per split on M1: threadgroups = splits x KV heads, sized against the GPU cores.
+
+    While one wave fits (about one threadgroup per core, 1024..4096 keys per split), use
+    it. Past the 4096-key cap the same sizing would leave a few threadgroups more than
+    cores: a second, nearly empty wave (M1 Max 76k keys: 38 threadgroups on 32 cores,
+    decode attention 4.3 ms against 3.1; M1 Ultra 133k keys: 66 on 64, decode -17%).
+    There, use many small splits (about 8 per core, 512 keys at least) so the tail wave
+    is a small share of the work.
+    """
+    cores = cores or _m1_gpu_cores()
+    one_wave = -(-kv_len * kv_heads // cores)
+    if one_wave <= 4096:
+        return min(4096, max(1024, (one_wave + 63) // 64 * 64))
+    many = -(-kv_len * kv_heads // (8 * cores))
+    return min(4096, max(512, (many + 63) // 64 * 64))
 
 
 def _gqa_causal_sdpa(queries, keys, values, scale):
