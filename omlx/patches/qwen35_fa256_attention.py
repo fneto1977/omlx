@@ -18,14 +18,13 @@ from __future__ import annotations
 
 import functools
 import logging
-import os
 import sys
 import time
 
 import mlx.core as mx
 
+from omlx.custom_kernels.attention import fast as _attention_fast
 from omlx.custom_kernels.nax import is_nax_available
-from omlx.custom_kernels.qwen35_prefill import fast as _fa256_fast
 
 logger = logging.getLogger(__name__)
 
@@ -79,16 +78,20 @@ _K_BLOCK = 8
 # covers at most _M1_SDPA_WORK (heads * rows * keys, ~15-20ms there); below
 # _M1_SDPA_MIN_ROWS rows the GPU is under-occupied, so when even that many
 # rows exceed _M1_SDPA_MAX_WORK (~128k keys) the steel kernel keeps the call.
-# OMLX_FA256_M1_SDPA=0 disables the route.
+#
+# Both limits were tuned on an M1 Max, where the steel kernel's calibrated
+# dispatch budget is _M1_REF_BUDGET; they scale with the budget calibrated on
+# the machine at hand (about 2-4x smaller on an 8-core M1, 2x larger on an
+# Ultra), so a dispatch lasts about the same time everywhere.
 _M1_SDPA_WORK = 120_000_000
 _M1_SDPA_MAX_WORK = 160_000_000
+_M1_REF_BUDGET = 51_000_000
+_M1_WORK_SCALE = 1.0
 _M1_SDPA_MIN_ROWS = 64
 # The first prefill chunk (keys == queries == 2048) is 10-19% faster on the
 # steel kernel; from 3072 keys the chunked route wins by 6-32% (M1 Max,
 # 16/8, 24/4 and 16/2 layouts).
 _M1_SDPA_MIN_KV = 3072
-# Trim MLX's buffer cache above this many bytes after a chunked call.
-_M1_SDPA_CACHE_TRIM = 2 * 1024**3
 # Head_dim 512 (Gemma 4 global layers) has no fused MLX route at all, so the
 # stock path materializes every score: one 2048-row chunk over 128k keys
 # peaked at +8.9 GB and ran at 4.4 TFLOP/s on M1 Max; the chunked route ran
@@ -100,12 +103,12 @@ _M1_K_BLOCK = 16
 
 def _native_kernel():
     try:
-        from omlx.custom_kernels.qwen35_prefill import fast
+        from omlx.custom_kernels.attention import fast
     except Exception:
         return None
-    if not fast.has_symbol("qwen35_fa256_attention"):
+    if not fast.has_symbol("fa256_attention"):
         return None
-    return fast.qwen35_fa256_attention
+    return fast.fa256_attention
 
 
 def _has_quantized_cache(cache) -> bool:
@@ -182,9 +185,8 @@ def _auto_dispatch_budget(kernel, q_block: int, k_block: int) -> int:
         return _DEFAULT_DISPATCH_BUDGET
 
 
+@functools.cache
 def _m1_sdpa_enabled() -> bool:
-    if os.environ.get("OMLX_FA256_M1_SDPA", "").strip() == "0":
-        return False
     from omlx.utils.hardware import get_apple_gpu_generation
 
     return get_apple_gpu_generation() == 13
@@ -192,10 +194,11 @@ def _m1_sdpa_enabled() -> bool:
 
 def _m1_query_rows(q_heads: int, q_len: int, kv_len: int) -> int:
     """Query rows per MLX SDPA dispatch on M1, or 0 to keep the steel kernel."""
+    work = _M1_SDPA_WORK * _M1_WORK_SCALE
     rows = q_len
-    while rows > _M1_SDPA_MIN_ROWS and q_heads * rows * kv_len > _M1_SDPA_WORK:
+    while rows > _M1_SDPA_MIN_ROWS and q_heads * rows * kv_len > work:
         rows = max(_M1_SDPA_MIN_ROWS, rows // 2)
-    if q_heads * rows * kv_len > _M1_SDPA_MAX_WORK:
+    if q_heads * rows * kv_len > _M1_SDPA_MAX_WORK * _M1_WORK_SCALE:
         return 0
     return rows
 
@@ -230,14 +233,6 @@ def _m1_chunked_sdpa(queries, keys, values, scale: float, rows: int) -> mx.array
             if outs:
                 mx.eval(outs[-1])
         outs.append(out)
-    # Block scratch sizes change with every block and every prefill chunk
-    # (the keys grow), so MLX's buffer cache cannot reuse them and grew to
-    # tens of GB over a long prefill; the scheduler then read that footprint
-    # as prefill memory pressure, released the ANE banks and throttled
-    # chunks. Trimming it costs one re-allocation per few layers.
-    if mx.get_cache_memory() > _M1_SDPA_CACHE_TRIM:
-        mx.eval(outs[-1])
-        mx.clear_cache()
     return outs[0] if len(outs) == 1 else mx.concatenate(outs, axis=2)
 
 
@@ -261,16 +256,11 @@ def _m1_d512_attention(queries, keys, values, cache, scale, mask, sinks):
         or keys.shape[-3] == 0
         or queries.shape[-3] % keys.shape[-3]
         or keys.shape[-2] < max(_M1_D512_MIN_KV, queries.shape[-2])
-        or not _m1_sdpa_enabled_cached()
+        or not _m1_sdpa_enabled()
     ):
         return None
     rows = _m1_query_rows(queries.shape[1], queries.shape[2], keys.shape[2])
     return _m1_chunked_sdpa(queries, keys, values, scale, rows or _M1_SDPA_MIN_ROWS)
-
-
-@functools.cache
-def _m1_sdpa_enabled_cached() -> bool:
-    return _m1_sdpa_enabled()
 
 
 def _should_route(queries, keys, cache, mask, sinks, min_kv_len: int) -> bool:
@@ -327,7 +317,7 @@ def _should_route(queries, keys, cache, mask, sinks, min_kv_len: int) -> bool:
 
 
 def apply_qwen35_fa256_attention_patch(min_kv_len: int | None = None) -> bool:
-    global _PATCHED
+    global _PATCHED, _M1_WORK_SCALE
     if _PATCHED:
         return True
     if is_nax_available():
@@ -352,7 +342,7 @@ def apply_qwen35_fa256_attention_patch(min_kv_len: int | None = None) -> bool:
     if m1_sdpa:
         # 16-key tiles measured 3-7% faster than 8 on M1 Max (98k keys).
         k_block = _M1_K_BLOCK
-    if not _fa256_fast.fa256_supports_dispatch_budget():
+    if not _attention_fast.fa256_supports_dispatch_budget():
         logger.warning(
             "Qwen FA-256 steel kernel predates chunked dispatch (issue "
             "#2225); long-context prefill may hit the IOGPU preemption "
@@ -362,6 +352,9 @@ def apply_qwen35_fa256_attention_patch(min_kv_len: int | None = None) -> bool:
         dispatch_budget = 0
     else:
         dispatch_budget = _auto_dispatch_budget(kernel, q_block, k_block)
+        if m1_sdpa and dispatch_budget != _DEFAULT_DISPATCH_BUDGET:
+            _M1_WORK_SCALE = min(4.0, max(0.1, dispatch_budget / _M1_REF_BUDGET))
+            logger.info("M1 chunked SDPA work scale %.2f", _M1_WORK_SCALE)
 
     def attend(queries, keys, values, scale):
         if m1_sdpa and keys.shape[2] >= _M1_SDPA_MIN_KV:

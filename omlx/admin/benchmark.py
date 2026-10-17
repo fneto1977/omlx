@@ -360,16 +360,8 @@ _UPLOADED_SETTING_FIELDS = (
     "dflash_draft_model",
     "dflash_draft_quant_enabled",
     "dflash_draft_quant_weight_bits",
-    "dflash_draft_quant_activation_bits",
     "dflash_draft_quant_group_size",
-    "dflash_max_ctx",
-    "dflash_in_memory_cache",
-    "dflash_in_memory_cache_max_entries",
-    "dflash_in_memory_cache_max_bytes",
-    "dflash_ssd_cache",
-    "dflash_ssd_cache_max_bytes",
     "dflash_draft_window_size",
-    "dflash_draft_sink_size",
     "dflash_block_size",
     "dflash_verify_mode",
     "mtp_enabled",
@@ -742,11 +734,11 @@ async def _run_single_test(
     ane_profile: dict[str, dict[str, float]] = {}
 
     try:
-        from omlx.custom_kernels.qwen35_prefill import fast
+        from omlx.custom_kernels.quant_matmul import ane as fast
 
-        ane_profile_enabled = fast.qwen35_ane_profile_set_enabled(True)
+        ane_profile_enabled = fast.ane_profile_set_enabled(True)
         if ane_profile_enabled:
-            fast.qwen35_ane_profile_reset()
+            fast.ane_profile_reset()
     except Exception:
         logger.debug("Benchmark ANE profiler unavailable", exc_info=True)
 
@@ -785,9 +777,9 @@ async def _run_single_test(
     finally:
         if ane_profile_enabled:
             try:
-                ane_profile = fast.qwen35_ane_profile_snapshot()
+                ane_profile = fast.ane_profile_snapshot()
             finally:
-                fast.qwen35_ane_profile_set_enabled(False)
+                fast.ane_profile_set_enabled(False)
 
     end_time = time.perf_counter()
 

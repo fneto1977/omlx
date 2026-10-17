@@ -27,14 +27,12 @@ Numerics: fp32 accumulation, per-group ``scale * sum(x*q) + bias * sum(x)``
 like qmv. Rows are not bit-identical to the one-row decode (same class as the
 other verify kernels); ``OMLX_MTP_ROW_EXACT_VERIFY`` models never get here.
 
-Gating: on by default only for applegpu_g13; ``OMLX_M1_VERIFY_QMV=1`` forces
-it on (to try other pre-NAX GPUs), ``=0`` disables it.
+Gating: applegpu_g13 only (where it was measured).
 """
 
 from __future__ import annotations
 
 import logging
-import os
 from functools import cache
 
 logger = logging.getLogger(__name__)
@@ -45,8 +43,6 @@ MIN_ROWS = 2
 # simdgroup-matrix tiles are cheaper than streaming more rows per lane.
 _MAX_ROWS = {4: 4, 5: 3}
 MAX_ROWS = max(_MAX_ROWS.values())
-# Benchmarks only: force (rpsg, nsg) for every call.
-_GEOMETRY_OVERRIDE = None
 # Values each lane owns per K block: a 4-bit pair of words, or a whole
 # 5-word 5-bit run (32 values, so every lane starts word aligned).
 _VPT = {4: 16, 5: 32}
@@ -58,13 +54,6 @@ _MIN_N = 1024
 
 @cache
 def enabled() -> bool:
-    flag = os.environ.get("OMLX_M1_VERIFY_QMV")
-    if flag is not None:
-        on = flag.strip() not in ("0", "false", "False", "")
-        logger.info(
-            "M1 verify qmv %s by OMLX_M1_VERIFY_QMV", "enabled" if on else "disabled"
-        )
-        return on
     from omlx.utils.hardware import get_apple_gpu_generation
 
     on = get_apple_gpu_generation() == 13
@@ -218,9 +207,7 @@ def m1_qmm(x2, w_q, scales, biases, *, bits: int, group_size: int):
     del group_size  # derived in-kernel from the scales shape
     M = int(x2.shape[0])
     N = int(w_q.shape[0])
-    rpsg, nsg = (
-        geometry(M, int(bits), N) if _GEOMETRY_OVERRIDE is None else _GEOMETRY_OVERRIDE
-    )
+    rpsg, nsg = geometry(M, int(bits), N)
     (y,) = _kernel(M, int(bits), rpsg, nsg)(
         inputs=[x2, w_q, scales, biases],
         template=[("T", x2.dtype)],

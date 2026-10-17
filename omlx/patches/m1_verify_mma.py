@@ -53,15 +53,13 @@ per projection; one-row decode is 0.169):
     before  0.315  0.328  0.353   0.660   (sg8 / mma)
     this    0.289  0.288  0.287   0.471
 
-Gating: applegpu_g13 by default (where it was measured);
-``OMLX_M1_VERIFY_MMA=1`` forces it on elsewhere, ``=0`` disables it.
+Gating: applegpu_g13 only (where it was measured).
 """
 
 from __future__ import annotations
 
 import logging
 import math
-import os
 from functools import cache
 
 logger = logging.getLogger(__name__)
@@ -69,7 +67,7 @@ logger = logging.getLogger(__name__)
 GROUP = 64
 BITS = 4
 RT_MAX = 2  # 8-row tiles per threadgroup (16 rows)
-# Measured window on M1 Max (see docs/m1-performance-plan.md, phase 2).
+# Measured window on M1 Max (4-bit, 5-16 rows).
 MIN_ROWS = 5
 MAX_ROWS = 16
 # Small outputs (GDN a/b heads) stay on the stock path.
@@ -177,15 +175,9 @@ _SRC = r"""
   }
 """
 
-# Benchmarks only: force (NT, S) for every call.
-_GEOMETRY_OVERRIDE = None
-
 
 @cache
 def enabled() -> bool:
-    flag = os.environ.get("OMLX_M1_VERIFY_MMA")
-    if flag is not None:
-        return flag.strip() not in ("0", "false", "False", "")
     from omlx.utils.hardware import get_apple_gpu_generation
 
     on = get_apple_gpu_generation() == 13
@@ -211,8 +203,6 @@ def eligible(M: int, K: int, N: int, bits: int, group_size: int, dtype) -> bool:
 
 def geometry(n: int, rt: int) -> tuple[int, int]:
     """(8-column tiles per simdgroup, simdgroups per threadgroup)."""
-    if _GEOMETRY_OVERRIDE is not None:
-        return _GEOMETRY_OVERRIDE
     # Two row tiles double the register footprint: on M1 the compiled
     # pipeline then admits at most 384 threads; 4 x 4 measured best there.
     if rt > 1:
