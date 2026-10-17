@@ -206,34 +206,38 @@ def _m1_query_rows(q_heads: int, q_len: int, kv_len: int) -> int:
 def _m1_chunked_sdpa(queries, keys, values, scale: float, rows: int) -> mx.array:
     """Causal SDPA for queries at the end of the keys, ``rows`` per dispatch.
 
-    Rows [start, stop) attend to keys [0, kv_len - (q_len - stop)), which is
-    exactly the end-aligned causal mask restricted to that row block.
-
     Each block materializes its scores (head_dim 256 is not a fused SDPA
-    size on these GPUs) and copies its key/value prefix, so at most two
-    blocks are kept in flight: block ``i`` is submitted, then block ``i-1``
-    is waited on and its scratch released. Unbounded, a 2048-row chunk at
-    98k keys peaked at +6.1 GB; this way +0.6 GB, at the same speed.
+    size on these GPUs), so at most two blocks are kept in flight: block
+    ``i`` is submitted, then block ``i-1`` is waited on and its scratch
+    released.
+
+    Every block attends to all the keys through an explicit causal mask,
+    rather than to its own end-aligned prefix. The prefix would skip only the
+    last few thousand keys, but it gives every block a different scratch
+    size, and MLX's buffer cache cannot reuse those: after one call it held
+    4-8 GB of them (10 GiB above the steel route on an M1 Ultra at 134k
+    keys). With one size for all blocks the cache stays below 0.6 GB, at the
+    same speed within 2-5%.
     """
     q_len = queries.shape[2]
     kv_len = keys.shape[2]
+    if q_len <= rows:
+        return mx.fast.scaled_dot_product_attention(
+            queries, keys, values, scale=scale, mask="causal"
+        )
+    cols = mx.arange(kv_len)[None, :]
     outs = []
     for start in range(0, q_len, rows):
         stop = min(q_len, start + rows)
-        end = kv_len - (q_len - stop)
+        last = mx.arange(start, stop)[:, None] + (kv_len - q_len)
         out = mx.fast.scaled_dot_product_attention(
-            queries[:, :, start:stop],
-            keys[:, :, :end],
-            values[:, :, :end],
-            scale=scale,
-            mask="causal",
+            queries[:, :, start:stop], keys, values, scale=scale, mask=cols <= last
         )
-        if q_len > rows:
-            mx.async_eval(out)
-            if outs:
-                mx.eval(outs[-1])
+        mx.async_eval(out)
+        if outs:
+            mx.eval(outs[-1])
         outs.append(out)
-    return outs[0] if len(outs) == 1 else mx.concatenate(outs, axis=2)
+    return mx.concatenate(outs, axis=2)
 
 
 def _m1_d512_attention(queries, keys, values, cache, scale, mask, sinks):

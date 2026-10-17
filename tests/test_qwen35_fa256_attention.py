@@ -417,3 +417,22 @@ def test_d512_route_matches_dense_causal(monkeypatch):
     assert out is not None and out.shape == q.shape
     ref = _reference(q, k, k, 512**-0.5)
     assert mx.max(mx.abs(out.astype(mx.float32) - ref)).item() < 2e-2
+
+
+@_needs_metal
+def test_chunked_sdpa_blocks_share_one_scratch_size(monkeypatch):
+    # Blocks of different sizes leave MLX's buffer cache holding GBs of
+    # scratch it cannot reuse; every block must see the same key length.
+    seen = []
+    real = mx.fast.scaled_dot_product_attention
+
+    def spy(q, k, v, **kwargs):
+        seen.append((k.shape, kwargs["mask"].shape if hasattr(kwargs["mask"], "shape") else None))
+        return real(q, k, v, **kwargs)
+
+    monkeypatch.setattr(mx.fast, "scaled_dot_product_attention", spy)
+    q = mx.random.normal((1, 8, 256, 64)).astype(mx.float16)
+    k = mx.random.normal((1, 2, 4096, 64)).astype(mx.float16)
+    patch._m1_chunked_sdpa(q, k, k, 0.125, 64)
+    assert len(seen) == 4
+    assert len(set(seen)) == 1
