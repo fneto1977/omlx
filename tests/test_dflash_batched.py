@@ -884,3 +884,39 @@ def test_verify_mode_selects_adaptive_depth():
         dd.resolve_verify_mode("tree")
     # Settings saved before ddtree was removed load as adaptive.
     assert ModelSettings(dflash_verify_mode="ddtree").dflash_verify_mode == "adaptive"
+
+
+class _Embed(nn.Module):
+    def __init__(self, dtype):
+        super().__init__()
+        self.weight = mx.zeros((8, 4), dtype=dtype)
+
+
+def _target(dtype):
+    target = nn.Module()
+    target.language_model = nn.Module()
+    target.language_model.model = nn.Module()
+    target.language_model.model.embed_tokens = _Embed(dtype)
+    return target
+
+
+def _bf16_drafter(scale=1.0):
+    model = nn.Linear(4, 4)
+    model.update({"weight": (mx.ones((4, 4)) * scale).astype(mx.bfloat16)})
+    model.update({"bias": mx.ones((4,), dtype=mx.bfloat16)})
+    return model
+
+
+def test_drafter_cast_to_fp16_target():
+    model = _bf16_drafter()
+    assert dd.match_target_dtype(model, _target(mx.float16)) == 2
+    assert model.weight.dtype == mx.float16 and model.bias.dtype == mx.float16
+
+
+def test_drafter_kept_for_bf16_target_or_out_of_range_weights():
+    model = _bf16_drafter()
+    assert dd.match_target_dtype(model, _target(mx.bfloat16)) == 0
+    assert model.weight.dtype == mx.bfloat16
+    big = _bf16_drafter(scale=1e5)
+    assert dd.match_target_dtype(big, _target(mx.float16)) == 0
+    assert big.weight.dtype == mx.bfloat16
