@@ -920,3 +920,35 @@ def test_drafter_kept_for_bf16_target_or_out_of_range_weights():
     big = _bf16_drafter(scale=1e5)
     assert dd.match_target_dtype(big, _target(mx.float16)) == 0
     assert big.weight.dtype == mx.bfloat16
+
+
+def _as_dtype(drafter, dtype):
+    drafter.model.update(
+        nn.utils.tree_map(
+            lambda p: p.astype(dtype)
+            if isinstance(p, mx.array) and mx.issubdtype(p.dtype, mx.floating)
+            else p,
+            drafter.model.parameters(),
+        )
+    )
+    mx.eval(drafter.model.parameters())
+    return drafter
+
+
+def test_fp16_drafter_survives_activations_past_fp16_range():
+    """DFlash2 residuals and output convolutions exceed 65504 on real drafters."""
+    plan = [{0: (5, 3), 1: (2, 9)}, {0: (1, 11), 1: (3, 4)}, {0: (2, 8), 1: (1, 1)}]
+
+    def widened(dtype):
+        drafter = _tiny_drafter(seed=3)
+        # The real drafter's MLP output stays inside fp16 and its output
+        # convolution widens it past 65504 (2e4 -> 1.5e5 on the Qwen3.8
+        # DFlash2 drafter); scale both the same way here.
+        for layer in drafter.model.layers:
+            layer.mlp.down_proj.weight = layer.mlp.down_proj.weight * 5000.0
+            layer.mlp_conv.base_kernel = layer.mlp_conv.base_kernel * 16.0
+        return _as_dtype(drafter, dtype)
+
+    reference = _run_cycles(widened(mx.float32), plan)
+    got = _run_cycles(widened(mx.float16), plan)
+    assert got == reference
