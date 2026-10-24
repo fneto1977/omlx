@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""M1-class verify kernels (multi-row qmv, 5-16 row MMA): numerics, gating, routing."""
+"""M1-class verify kernels (multi-row qmv, 5-16 row 4- and 5-bit MMA): numerics, gating, routing."""
 
 from __future__ import annotations
 
@@ -7,7 +7,7 @@ import mlx.core as mx
 import mlx.nn as nn
 import pytest
 
-from omlx.patches import m1_verify_mma, m1_verify_qmv, qwen35_verify_qmm
+from omlx.patches import m1_verify_mma, m1_verify_mma5, m1_verify_qmv, qwen35_verify_qmm
 
 pytestmark = pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
 
@@ -160,10 +160,90 @@ def test_window_and_route_order(mma_on):
     assert route(3, 5120, 17408, 4, 64, f16) == "m1"
     assert route(8, 5120, 17408, 4, 64, f16) == "m1_mma"
     assert route(12, 5120, 17408, 4, 64, f16) == "m1_mma"
-    # 5-bit beyond the qmv window keeps the previous kernels
-    assert route(8, 5120, 17408, 5, 64, f16) == "sg8"
+    # 5-bit beyond the qmv window takes the 5-bit MMA kernel
+    assert route(8, 5120, 17408, 5, 64, f16) == "m1_mma5"
 
 
 def test_disabled_when_the_gate_is_off(monkeypatch):
     monkeypatch.setattr(m1_verify_mma, "enabled", lambda: False)
     assert not m1_verify_mma.eligible(8, 2048, 4096, 4, 64, mx.float16)
+
+
+# --- 5-16 row 5-bit MMA kernel ----------------------------------------------
+
+
+@pytest.mark.parametrize("rows", [5, 8, 9, 13, 16])
+@pytest.mark.parametrize("k,n", [(2048, 1024), (5120, 4096)])
+@pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16])
+def test_mma5_matches_fp32_reference(mma_on, rows, k, n, dtype):
+    mx.random.seed(rows + n)
+    w, scales, biases = mx.quantize(
+        (mx.random.normal((n, k)) * 0.05).astype(dtype), group_size=64, bits=5
+    )
+    x = mx.random.normal((rows, k)).astype(dtype)
+    assert m1_verify_mma5.eligible(rows, k, n, 5, 64, dtype)
+    out = m1_verify_mma5.m1_mma5_qmm(x, w, scales, biases)
+    ref = mx.quantized_matmul(
+        x.astype(mx.float32),
+        w,
+        scales.astype(mx.float32),
+        biases.astype(mx.float32),
+        transpose=True,
+        group_size=64,
+        bits=5,
+    )
+    assert out.shape == (rows, n) and out.dtype == dtype
+    err = mx.max(mx.abs(out.astype(mx.float32) - ref)).item()
+    assert err <= 5e-3 * mx.max(mx.abs(ref)).item()
+
+
+def test_mma5_window_and_route_order(mma_on):
+    f16 = mx.float16
+    assert not m1_verify_mma5.eligible(4, 2048, 4096, 5, 64, f16)
+    assert not m1_verify_mma5.eligible(17, 2048, 4096, 5, 64, f16)
+    assert not m1_verify_mma5.eligible(8, 2048, 4096, 4, 64, f16)
+    assert not m1_verify_mma5.eligible(8, 2048, 4096, 5, 128, f16)
+    assert not m1_verify_mma5.eligible(8, 2048, 512, 5, 64, f16)
+    route = qwen35_verify_qmm._verify_route
+    assert route(3, 17408, 5120, 5, 64, f16) == "m1"
+    assert route(5, 17408, 5120, 5, 64, f16) == "m1_mma5"
+    assert route(16, 17408, 5120, 5, 64, f16) == "m1_mma5"
+
+
+def test_mma5_off_with_the_m1_gate(monkeypatch):
+    monkeypatch.setattr(m1_verify_mma, "enabled", lambda: False)
+    assert not m1_verify_mma5.eligible(8, 2048, 4096, 5, 64, mx.float16)
+    assert qwen35_verify_qmm._verify_route(8, 5120, 17408, 5, 64, mx.float16) == "sg8"
+
+
+def test_armed_5bit_linear_takes_mma5_in_its_own_buffers(mma_on):
+    assert qwen35_verify_qmm.apply_verify_qmm_patch()
+    linear = nn.QuantizedLinear(2048, 1024, bias=False, group_size=64, bits=5)
+    linear.weight, linear.scales, linear.biases = _quantized(2048, 1024, 5, 64, mx.float16)
+    original = (linear.weight, linear.scales, linear.biases)
+    x = mx.random.normal((1, 8, 2048)).astype(mx.float16)
+    stock = linear(x)
+
+    calls = []
+    real = m1_verify_mma5.m1_mma5_qmm
+
+    def spy(*args, **kwargs):
+        calls.append(args[0].shape)
+        return real(*args, **kwargs)
+
+    m1_verify_mma5.m1_mma5_qmm = spy
+    try:
+        qwen35_verify_qmm.set_verify_qmm_armed(True)
+        routed = linear(x)
+        moved = linear.weight
+        again = linear(x)
+    finally:
+        qwen35_verify_qmm.set_verify_qmm_armed(False)
+        m1_verify_mma5.m1_mma5_qmm = real
+    assert calls == [(8, 2048), (8, 2048)]
+    assert mx.allclose(routed, stock, atol=2e-2, rtol=2e-2).item()
+    assert mx.array_equal(routed, again).item()
+    # The projection now owns copies of its parameters, made once and bit-identical.
+    assert linear.weight is moved and linear.weight is not original[0]
+    for new, old in zip((linear.weight, linear.scales, linear.biases), original):
+        assert mx.array_equal(new, old).item()

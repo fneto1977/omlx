@@ -72,7 +72,7 @@ from __future__ import annotations
 import logging
 import threading
 
-from . import m1_verify_mma, m1_verify_qmv
+from . import m1_verify_mma, m1_verify_mma5, m1_verify_qmv
 
 logger = logging.getLogger(__name__)
 
@@ -1501,17 +1501,19 @@ def _patch_verify_layer_flush() -> None:
 
 
 def _m1_route(rows: int, K: int, N: int, bits: int, group_size: int, dtype):
-    """M1-class kernel for a verify projection ("m1", "m1_mma") or None."""
+    """M1-class kernel for a verify projection ("m1", "m1_mma", "m1_mma5") or None."""
     if m1_verify_qmv.eligible(rows, K, N, bits, group_size, dtype):
         return "m1"
     if m1_verify_mma.eligible(rows, K, N, bits, group_size, dtype):
         return "m1_mma"
+    if m1_verify_mma5.eligible(rows, K, N, bits, group_size, dtype):
+        return "m1_mma5"
     return None
 
 
 def _verify_route(rows: int, K: int, N: int, bits: int, group_size: int, dtype):
-    """Kernel an armed verify projection runs ("m1", "m1_mma", "sg8", "mma" or
-    "vk"), or None for the stock qmm."""
+    """Kernel an armed verify projection runs ("m1", "m1_mma", "m1_mma5", "sg8",
+    "mma" or "vk"), or None for the stock qmm."""
     m1 = _m1_route(rows, K, N, bits, group_size, dtype)
     if m1:
         return m1
@@ -1581,7 +1583,7 @@ def apply_verify_qmm_patch() -> bool:
         try:
             # Batched verify rows (requests x block) share one weight pass.
             x2 = x.reshape(rows, K)
-            if route in ("m1", "m1_mma") and self.scales.dtype != x.dtype:
+            if route in ("m1", "m1_mma", "m1_mma5") and self.scales.dtype != x.dtype:
                 return orig_call(self, x)
             if route == "m1":
                 y = m1_verify_qmv.m1_qmm(
@@ -1601,6 +1603,9 @@ def apply_verify_qmm_patch() -> bool:
                     bits=self.bits,
                     group_size=self.group_size,
                 )
+            elif route == "m1_mma5":
+                m1_verify_mma5.own_buffers(self)
+                y = m1_verify_mma5.m1_mma5_qmm(x2, self.weight, self.scales, self.biases)
             elif route == "sg8":
                 y = vk_qmm_sg8(
                     x2,
