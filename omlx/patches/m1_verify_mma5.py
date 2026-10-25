@@ -44,6 +44,7 @@ from functools import cache
 from . import m1_verify_mma
 
 logger = logging.getLogger(__name__)
+_ENGAGED_LOGGED = False
 
 GROUP = 64
 BITS = 5
@@ -203,6 +204,14 @@ def own_buffers(layer) -> None:
     layer.biases = layer.biases * mx.array(1, dtype=layer.biases.dtype)
     mx.eval(layer.weight, layer.scales, layer.biases)
     layer._omlx_mma5_own_buffers = True
+    global _ENGAGED_LOGGED
+    if not _ENGAGED_LOGGED:
+        _ENGAGED_LOGGED = True
+        logger.info(
+            "M1 5-bit verify MMA engaged (rows %d..%d); projections move into their own buffers on first use",
+            MIN_ROWS,
+            MAX_ROWS,
+        )
     logger.debug("m1_mma5: moved a %s projection into its own buffers", tuple(layer.weight.shape))
 
 
