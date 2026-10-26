@@ -1604,7 +1604,6 @@ def apply_verify_qmm_patch() -> bool:
                     group_size=self.group_size,
                 )
             elif route == "m1_mma5":
-                m1_verify_mma5.own_buffers(self)
                 y = m1_verify_mma5.m1_mma5_qmm(x2, self.weight, self.scales, self.biases)
             elif route == "sg8":
                 y = vk_qmm_sg8(

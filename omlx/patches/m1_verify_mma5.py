@@ -12,25 +12,17 @@ chunk. MMA step s takes field s: fields 0..5 masked in place in the low word
 against inputs pre-scaled by 2^-5s, field 7 masked in place in the high byte
 against 2^-3, and field 6, which straddles the two, shifted out (pre-scale 1).
 
-Weight placement: reading 8 weight rows at once, this kernel is sensitive to
-how the weight buffers are mapped. On weights as loaded (one buffer per
-safetensors shard), Metal GPU counters show a 15-20% TLB miss rate and the
-kernel runs 2-3x slower than sg8; on the same weights copied into their own
-buffers the miss rate is ~2.5% and it is faster. So the first time a
-projection takes this route its weight, scales and biases are replaced by
-copies in fresh buffers (bit-identical; the originals are released). The
-one-row decode and the other routes measured the same on both placements.
-
 Numerics: fp32 accumulation; row-count invariant; not bit-identical to the
 one-row decode (same class as the other verify kernels).
 
-Measured on M1 Max (fp16, Qwen3.8-27B 5-bit projections, chain over all
-layers, vs the sg8 / m1 route they replace):
+Measured on M1 Max (fp16, Qwen3.8-27B, chain over the layers whose
+projection is 5-bit, weights as loaded, vs the sg8 / mma route they replace):
 
     rows             5     8     9    12    16
-    mlp.down_proj  -10%  -12%  -21%  -22%  -21%
-    gdn.in_proj_z   -1%   -8%  -21%  -21%  -19%
-    gdn.out_proj   -12%  -23%  -41%  -41%  -39%
+    mlp.down_proj  -29%  -33%  -45%  -44%  -43%
+    gdn.in_proj_z   -9%  -20%  -39%  -38%  -36%
+    gdn.out_proj   -10%  -22%  -41%  -40%  -38%
+    attn.o_proj    -10%  -19%  -38%  -38%  -36%
 
 Gating: applegpu_g13 only (where it was measured).
 """
@@ -192,29 +184,6 @@ def eligible(M: int, K: int, N: int, bits: int, group_size: int, dtype) -> bool:
     )
 
 
-def own_buffers(layer) -> None:
-    """Move a QuantizedLinear's weight, scales and biases into fresh buffers, once."""
-    if getattr(layer, "_omlx_mma5_own_buffers", False):
-        return
-    import mlx.core as mx
-
-    # Elementwise no-ops produce new arrays, so each lands in its own buffer.
-    layer.weight = layer.weight ^ mx.array(0, dtype=layer.weight.dtype)
-    layer.scales = layer.scales * mx.array(1, dtype=layer.scales.dtype)
-    layer.biases = layer.biases * mx.array(1, dtype=layer.biases.dtype)
-    mx.eval(layer.weight, layer.scales, layer.biases)
-    layer._omlx_mma5_own_buffers = True
-    global _ENGAGED_LOGGED
-    if not _ENGAGED_LOGGED:
-        _ENGAGED_LOGGED = True
-        logger.info(
-            "M1 5-bit verify MMA engaged (rows %d..%d); projections move into their own buffers on first use",
-            MIN_ROWS,
-            MAX_ROWS,
-        )
-    logger.debug("m1_mma5: moved a %s projection into its own buffers", tuple(layer.weight.shape))
-
-
 @cache
 def _kernel():
     import mlx.core as mx
@@ -230,6 +199,10 @@ def _kernel():
 
 def m1_mma5_qmm(x2, w_q, scales, biases):
     """(M, K) x (N, K)^T -> (M, N), 5-bit affine groups of 64, M in 5..16."""
+    global _ENGAGED_LOGGED
+    if not _ENGAGED_LOGGED:
+        _ENGAGED_LOGGED = True
+        logger.info("M1 5-bit verify MMA engaged (rows %d..%d)", MIN_ROWS, MAX_ROWS)
     rows, k = int(x2.shape[0]), int(x2.shape[1])
     n = int(w_q.shape[0])
     rt = min(m1_verify_mma.RT_MAX, (rows + 7) // 8)

@@ -216,7 +216,7 @@ def test_mma5_off_with_the_m1_gate(monkeypatch):
     assert qwen35_verify_qmm._verify_route(8, 5120, 17408, 5, 64, mx.float16) == "sg8"
 
 
-def test_armed_5bit_linear_takes_mma5_in_its_own_buffers(mma_on):
+def test_armed_5bit_linear_takes_mma5(mma_on):
     assert qwen35_verify_qmm.apply_verify_qmm_patch()
     linear = nn.QuantizedLinear(2048, 1024, bias=False, group_size=64, bits=5)
     linear.weight, linear.scales, linear.biases = _quantized(2048, 1024, 5, 64, mx.float16)
@@ -235,7 +235,6 @@ def test_armed_5bit_linear_takes_mma5_in_its_own_buffers(mma_on):
     try:
         qwen35_verify_qmm.set_verify_qmm_armed(True)
         routed = linear(x)
-        moved = linear.weight
         again = linear(x)
     finally:
         qwen35_verify_qmm.set_verify_qmm_armed(False)
@@ -243,7 +242,5 @@ def test_armed_5bit_linear_takes_mma5_in_its_own_buffers(mma_on):
     assert calls == [(8, 2048), (8, 2048)]
     assert mx.allclose(routed, stock, atol=2e-2, rtol=2e-2).item()
     assert mx.array_equal(routed, again).item()
-    # The projection now owns copies of its parameters, made once and bit-identical.
-    assert linear.weight is moved and linear.weight is not original[0]
-    for new, old in zip((linear.weight, linear.scales, linear.biases), original):
-        assert mx.array_equal(new, old).item()
+    # The route reads the parameters as they are; nothing is replaced.
+    assert all(a is b for a, b in zip((linear.weight, linear.scales, linear.biases), original))
